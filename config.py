@@ -16,13 +16,37 @@ MODELS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 # Camera Configuration for Real-Time
+# Camera Configuration for Real-Time
 CAMERA_CONFIG = {
-    'type': 'v4l2',
-    'device': 10,  # /dev/video10
-    'width': 1920,
-    'height': 1080,
+    'type': 'webcam',    # PC Webcam
+    'device': 0,        # Default Value 0
+    'width': 1280,      # Standard Webcam Res
+    'height': 720,
     'fps': 30,
 }
+# CAMERA_CONFIG = {
+#     'type': 'v4l2',    # Jetson typically uses v4l2
+#     'device': 10,       # Default to 0 (Video0) - Adjust if using specific ID like 10
+#     'width': 1408,     # ICAM-540 max resolution
+#     'height': 1080,
+#     'fps': 30,
+# }
+
+
+# ========== API CONFIGURATION ==========
+API_ENDPOINT = "https://api2.checkology-cloud.io/api/kegs/fillingareaupdatecamera"
+BEER_TYPES_ENDPOINT = "https://api2.checkology-cloud.io/api/kegs/cam/beer-types"
+CAMERA_NAME = "ICAM-540"
+CAMERA_MAC_ID = "3C:6D:66:01:5A:F0"
+CAMERA_SERIAL = "icam-540"
+API_TIMEOUT = 10
+API_MAX_RETRIES = 3
+SSL_VERIFY = False  # Set to True in production
+ENABLE_PAYLOAD_HASH = True
+
+# Cloud sync settings
+CLOUD_CONFIG_ENDPOINT = f"{API_ENDPOINT}/api/current-config"
+CLOUD_SYNC_INTERVAL = 30
 
 # Keg Types and Pallet Configuration
 KEG_TYPES = {
@@ -46,42 +70,28 @@ PALLET_TYPES = ["EUR Pallet", "Industrial Pallet"]
 # Default settings
 DEFAULT_KEG_TYPE = "30L"
 DEFAULT_PALLET_TYPE = "EUR Pallet"
-DEFAULT_KEG_COUNT = 6  # Changed from expression to fixed value for utils.save_default_keg_count()
+DEFAULT_KEG_COUNT = 6
 MAX_KEG_COUNT = 20
 MIN_KEG_COUNT = 1
-STABILITY_THRESHOLD = 5  # Increased for better stability
+STABILITY_THRESHOLD = 5
 
 # FOV Validation
-FOV_ENABLED = True
 FOV_BOUNDARY_RATIO = 0.9
 MIN_OCCLUSION_THRESHOLD = 0.7
-
-# Camera identification for cloud
-CAMERA_NAME = "ICAM-540"  
-CAMERA_MAC_ID = "3C:6D:66:01:5A:F0"  
-CAMERA_SERIAL = "icam-540"
-
-# API Configuration
-API_ENDPOINT = "http://143.110.186.93:5001/api/kegs/fillingareaupdatecamera"
-BEER_TYPES_ENDPOINT = "http://143.110.186.93:5001/api/kegs/cam/beer-types"
-API_TIMEOUT = 10
-API_MAX_RETRIES = 3
-
-# Add SSL bypass for development
-SSL_VERIFY = False  # Set to True in production
-
-# Enable payload hash for integrity
-ENABLE_PAYLOAD_HASH = True
-
-# Cloud sync settings
-CLOUD_CONFIG_ENDPOINT = f"{API_ENDPOINT}/api/current-config"
-CLOUD_SYNC_INTERVAL = 30
 
 # Model Configuration
 KEG_MODEL_PATH = MODELS_DIR / "best.pt"
 QR_MODEL_PATH = MODELS_DIR / "model_qr" / "best.pt"
-KEG_CONF_THRESHOLD = 0.1
-QR_CONF_THRESHOLD = 0.4
+QR_CONF_THRESHOLD = 0.5
+
+# ========== GPU CONFIGURATION ==========
+GPU_CONFIG = {
+    'device': 0,                    # CUDA device ID (0 = first GPU)
+    'half_precision': False,        # FP16 might not be supported on CPU or some GPUs
+    'memory_fraction': 0.8,         # Max GPU memory fraction to use
+    'warmup_enabled': False,        # Warm up GPU at startup
+    'force_cpu': False,             # ENABLE GPU for Jetson
+}
 
 # Advanced QR Detection
 TILE_SIZE = (1280, 960)
@@ -99,6 +109,7 @@ NETWORK_CHECK_INTERVAL = 30
 # Alarm System Configuration
 ALARM_BLINK_INTERVAL = 0.5
 ENABLE_PHYSICAL_ALERTS = False
+FOV_ENABLED = False # Enabled for production/Jetsons
 
 # Application Settings
 MAX_FOLDER_SIZE_MB = 500

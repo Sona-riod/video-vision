@@ -1,12 +1,16 @@
 # Core Computer Vision & ML
 opencv-python>=4.8.0
 ultralytics>=8.0.0
+
+# PyTorch with CUDA (Install based on your CUDA version)
+# For CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# For CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 torch>=2.0.0
 torchvision>=0.15.0
 
 # QR Code Processing
 pyzbar>=0.1.9
-qreader>=3.10
+qreader>=3.10         # Uses PyTorch - GPU accelerated
 
 # UI & Utilities
 kivy>=2.2.0
@@ -14,3 +18,7 @@ requests>=2.31.0
 numpy>=1.24.0
 Pillow>=10.0.0
 urllib3>=2.0.0
+
+# Optional GPU Enhancements (uncomment if needed)
+# cupy-cuda11x        # GPU-accelerated NumPy (CUDA 11.x)
+# cupy-cuda12x        # GPU-accelerated NumPy (CUDA 12.x)

@@ -69,13 +69,14 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
 
         # Step 2: Advanced detection if needed
         if len(std_qrs) < required_count:
+            print(f"\n[PROCESS] Standard detection found {len(std_qrs)}/{required_count} QRs - Triggering ADVANCED DETECTION...")
             log.info(f"[{session_id}] Standard → {len(std_qrs)} QR(s), using advanced detection")
             try:
-                std_qrs = detect_qr_advanced(frame_path)
+                std_qrs, adv_found = detect_qr_advanced(frame_path)
+                print(f"[PROCESS] Standard + Advanced Combined: {adv_found} QRs")
                 method = "advanced"
                 adv_used = 1
-                adv_found = len(std_qrs)
-                std_dets = len(std_qrs)
+                std_dets = adv_found
                 log.info(f"[{session_id}] Advanced detection found {adv_found} QR(s)")
             except Exception as e:
                 error_msg = f"Advanced detection failed: {str(e)}"
@@ -90,13 +91,19 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
         # Auto filling date/time
         filling_date = datetime.now().isoformat()
         
+        # Extract purely the data strings for database operations
+        qr_strings = [qr['data'] if isinstance(qr, dict) else qr for qr in std_qrs]
+        print(f"  -> QR Strings for DB: {qr_strings}")
+        
         # Get keg types for each QR code
-        keg_types = [db.get_keg_type(qr) for qr in std_qrs]
+        keg_types = [db.get_keg_type(qr_data) for qr_data in qr_strings]
         
 
 
         # Step 3: Check for duplicates
-        already, old_session_id = db.is_pallet_processed(std_qrs, required_count)
+        print(f"  -> Checking for duplicates with: {qr_strings}")
+        already, old_session_id = db.is_pallet_processed(qr_strings, required_count)
+        print(f"  -> Duplicate check result: already={already}, old_session_id={old_session_id}")
         
         # NON-BLOCKING DUPLICATE CHECK
         if already:
@@ -119,7 +126,7 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
 
         # Step 4: Store QR codes with keg types
         new_global, decoded_cnt = db.store_qr_codes(
-            session_id, std_qrs, method, std_dets, keg_types
+            session_id, qr_strings, method, std_dets, keg_types
         )
         
         # Check for batch miss (insufficient QR codes)
@@ -137,7 +144,7 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
             composition = {'Unknown': decoded_cnt}
         
         # Mark pallet as processed
-        db.mark_pallet_processed(std_qrs, session_id, required_count)
+        db.mark_pallet_processed(qr_strings, session_id, required_count)
         
         # Step 5: Send to API
         print("\n" + "-"*40)
@@ -151,7 +158,7 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
         if not qr_list_db or not isinstance(qr_list_db, list):
             print("  -> WARNING: DB QR list invalid, using local list")
             log.warning(f"[{session_id}] DB QR list invalid, using local list")
-            qr_list_db = std_qrs
+            qr_list_db = qr_strings
             ts_db = datetime.now()
         print(f"  -> QR list from DB: {len(qr_list_db)} codes")
         print(f"  -> QR codes: {qr_list_db}")
@@ -160,7 +167,7 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
         if not qr_list_db:
             print("  -> ERROR: No QR codes detected - skipping API call")
             log.warning(f"[{session_id}] Skipping API: No QR codes detected (Empty Batch)")
-            db.update_api_status(session_id, 'api_failed', "Empty batch - not sent")
+            db.update_batch_status(session_id, 'api_failed', "Empty batch - not sent")
             return
         
         print("  -> Constructing payload...")

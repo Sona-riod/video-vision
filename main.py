@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# GPU Detection moved to after config load
+
+# --- CONFIGURATION FOR FULL SCREEN HMI ---
+# Must be done before other Kivy imports
+from kivy.config import Config
+# Config.set('graphics', 'fullscreen', 'auto') # Force full screen
+# Config.set('graphics', 'show_cursor', '1')   # Show mouse cursor (set to '0' for touch-only)
+Config.write()
+# -----------------------------------------
+
+
 import cv2
 import numpy as np
 import json
@@ -12,6 +23,15 @@ from datetime import datetime
 import requests
 import uuid
 import sqlite3
+
+# Setup main app logger
+import logging
+main_logger = logging.getLogger("MainApp")
+main_logger.setLevel(logging.DEBUG)
+if not main_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('[%(name)s] %(levelname)s: %(message)s'))
+    main_logger.addHandler(_handler)
 
 # Kivy Imports
 from kivy.app import App
@@ -35,31 +55,77 @@ import logging
 
 # Custom Modules
 from modules.camera import CameraManager
-from modules.detector import KegDetector, QRDetector
 from modules.database import DatabaseManager
 from modules.api_sender import APISender
 from modules.process_worker import submit_batch
 from modules.utils import setup_logging, create_timestamp, save_last_batch, load_last_batch
+
+# Lazy import QRDetector to avoid torch/torchvision issues at startup
+_QRDetector = None
+
+def get_qr_detector_class():
+    """Lazy load QRDetector to handle import errors gracefully."""
+    global _QRDetector
+    if _QRDetector is None:
+        try:
+            from modules.detector import QRDetector
+            _QRDetector = QRDetector
+            print("[MAIN] QRDetector loaded successfully")
+        except Exception as e:
+            print(f"[WARNING] QRDetector import failed: {e}")
+            # Create a dummy detector that returns empty results
+            class DummyQRDetector:
+                def __init__(self):
+                    print("[WARNING] Using dummy QR detector - no detection will occur")
+                def detect_and_decode(self, frame):
+                    return [], 0
+            _QRDetector = DummyQRDetector
+    return _QRDetector
+
+from modules.utils import setup_logging, create_timestamp, save_last_batch, load_last_batch
 from config import (
-    CAMERA_CONFIG, DEFAULT_KEG_COUNT, MAX_KEG_COUNT, KEG_TYPES, SAVE_FOLDER,
+    CAMERA_CONFIG, DEFAULT_KEG_COUNT, MAX_KEG_COUNT, SAVE_FOLDER,
     MIN_KEG_COUNT, STABILITY_THRESHOLD, COLOR_SCHEME,
     FOV_ENABLED, FOV_BOUNDARY_RATIO,
-    CLOUD_CONFIG_ENDPOINT, CLOUD_SYNC_INTERVAL, CAMERA_MAC_ID
+    CLOUD_CONFIG_ENDPOINT, CLOUD_SYNC_INTERVAL, CAMERA_MAC_ID, GPU_CONFIG
 )
+
+# ===== GPU DETECTION (Conditional) =====
+print("\n" + "="*60)
+print("   PALLETIZATION SYSTEM")
+print("="*60 + "\n")
+
+try:
+    if not GPU_CONFIG.get('force_cpu', False):
+        from modules.gpu_utils import detect_gpu, warm_up_gpu, GPU_STATUS
+        detect_gpu()
+        if GPU_STATUS.get('cuda_available'):
+            print("GPU MODE ENABLED")
+            warm_up_gpu()
+        else:
+            print("CPU MODE (No GPU detected)")
+    else:
+        print("CPU MODE (Forced by Config)")
+        # Define dummy GPU_STATUS if needed
+        GPU_STATUS = {'cuda_available': False}
+except Exception as e:
+    print(f"GPU Detection skipped: {e}")
+    GPU_STATUS = {'cuda_available': False}
+# =======================================
 
 # Setup logging
 logger = setup_logging()
 
 # Color Constants
-COLOR_BG_DARK = (0.1, 0.1, 0.1, 1)
-COLOR_PANEL_BG = (0.15, 0.15, 0.15, 1)
-COLOR_HIGHLIGHT = (0, 0.4, 0.8, 1)
-COLOR_TEXT_LIGHT = (0.9, 0.9, 0.9, 1)
-COLOR_ALERT_RED = (0.8, 0.2, 0.2, 1)
-COLOR_STATUS_GREEN = (0.2, 0.8, 0.2, 1)
+COLOR_BG_DARK = (1, 1, 1, 1)  # White
+COLOR_PANEL_BG = (0.95, 0.95, 0.98, 1)  # Very light blue-white
+COLOR_HIGHLIGHT = (0.0, 0.45, 0.85, 1)  # Brighter Blue
+COLOR_TEXT_LIGHT = (0.1, 0.1, 0.1, 1)  # Dark Grey (for contrast on white)
+COLOR_ALERT_RED = (0.9, 0.2, 0.2, 1)
+COLOR_STATUS_GREEN = (0.1, 0.7, 0.2, 1)
 COLOR_STATUS_ORANGE = (1, 0.6, 0, 1)
-COLOR_STATUS_BLUE = (0.2, 0.5, 0.8, 1)
-COLOR_BUTTON_NORMAL = (0.3, 0.3, 0.3, 1)
+COLOR_STATUS_BLUE = (0.2, 0.6, 0.9, 1)
+COLOR_BUTTON_NORMAL = (0.9, 0.92, 0.96, 1)  # Light Blueish Grey
 
 def hex_color(rgb_tuple):
     """Convert RGB tuple to hex color string"""
@@ -110,12 +176,17 @@ class ConfirmationModal(ModalView):
     def __init__(self, title, message, on_confirm, on_cancel=None, **kwargs):
         super().__init__(**kwargs)
         self.size_hint = (0.6, 0.35)
-        self.background_color = hex_color((0, 0, 0, 0.9))
+        self.background_color = hex_color((1, 1, 1, 0.95))
         self.on_confirm_callback = on_confirm
         self.on_cancel_callback = on_cancel
         self.auto_dismiss = False
         
         layout = BoxLayout(orientation='vertical', padding=20, spacing=15)
+        with layout.canvas.before:
+            Color(0.95, 0.95, 0.95, 1)  # Solid light background
+            self.rect = Rectangle(pos=layout.pos, size=layout.size)
+        layout.bind(pos=lambda *x: setattr(self.rect, 'pos', layout.pos))
+        layout.bind(size=lambda *x: setattr(self.rect, 'size', layout.size))
         
         # Title
         title_label = Label(
@@ -181,141 +252,158 @@ class ConfirmationModal(ModalView):
 class CountModal(ModalView):
     def __init__(self, on_confirm, current_count, **kwargs):
         super().__init__(**kwargs)
-        self.size_hint = (0.5, 0.45)
-        self.background_color = hex_color((0, 0, 0, 0.85))
+        self.size_hint = (0.5, 0.6)  # Taller for keypad
+        self.background_color = hex_color((0.95, 0.95, 0.95, 1)) # Explicit Light Grey for contrast
         self.on_confirm = on_confirm
+        self.current_value = str(current_count)
+        self.reset_input = True # Flag to overwrite value on first keypress
         
-        layout = BoxLayout(orientation='vertical', padding=20, spacing=10)
+        layout = BoxLayout(orientation='vertical', padding=20, spacing=15)
+        with layout.canvas.before:
+            Color(0.95, 0.95, 0.95, 1)  # Solid light background
+            self.bg_rect = Rectangle(pos=layout.pos, size=layout.size)
+        layout.bind(pos=lambda *x: setattr(self.bg_rect, 'pos', layout.pos))
+        layout.bind(size=lambda *x: setattr(self.bg_rect, 'size', layout.size))
         
         # Title
         title = Label(
             text='Set Target Keg Count',
             size_hint_y=None,
             height=40,
-            font_size='18sp',
+            font_size='22sp',
             bold=True,
             color=hex_color(COLOR_HIGHLIGHT)
         )
         
-        # Input field
-        input_box = BoxLayout(orientation='horizontal', size_hint_y=None, height=50, spacing=10)
-        self.input_field = TextInput(
-            text=str(current_count),
-            multiline=False,
-            font_size='20sp',
-            halign='center',
-            background_color=hex_color((0.2, 0.2, 0.2, 1)),
-            foreground_color=hex_color(COLOR_TEXT_LIGHT),
-            cursor_color=hex_color(COLOR_HIGHLIGHT),
-            size_hint_x=0.7
-        )
-        
-        # Quick +/- buttons
-        controls = GridLayout(cols=1, rows=2, spacing=5, size_hint_x=0.3)
-        
-        def increment(dt):
-            self.clear_error()
-            try:
-                val = int(self.input_field.text) + 1
-                if val <= MAX_KEG_COUNT:
-                    self.input_field.text = str(val)
-                else:
-                    self.show_error(f"Maximum is {MAX_KEG_COUNT}")
-            except:
-                self.show_error("Enter a valid number")
-                
-        def decrement(dt):
-            self.clear_error()
-            try:
-                val = int(self.input_field.text) - 1
-                if val >= MIN_KEG_COUNT:
-                    self.input_field.text = str(val)
-                else:
-                    self.show_error(f"Minimum is {MIN_KEG_COUNT}")
-            except:
-                self.show_error("Enter a valid number")
-        
-        plus_btn = Button(
-            text='+',
-            font_size='20sp',
-            background_color=hex_color(COLOR_STATUS_GREEN),
-            on_press=increment
-        )
-        
-        minus_btn = Button(
-            text='−',
-            font_size='20sp',
-            background_color=hex_color(COLOR_ALERT_RED),
-            on_press=decrement
-        )
-        
-        controls.add_widget(plus_btn)
-        controls.add_widget(minus_btn)
-        
-        input_box.add_widget(self.input_field)
-        input_box.add_widget(controls)
-        
-        # Error message label
-        self.error_label = Label(
-            text='',
+        # Display Area
+        self.display_label = Label(
+            text=self.current_value,
             size_hint_y=None,
-            height=25,
-            font_size='12sp',
-            color=hex_color(COLOR_ALERT_RED)
+            height=60,
+            font_size='40sp',
+            bold=True,
+            color=hex_color(COLOR_TEXT_LIGHT),
+            halign='center'
         )
         
-        # Action buttons
-        btn_layout = BoxLayout(size_hint_y=None, height=40, spacing=10)
-        cancel_btn = Button(
-            text='Cancel',
-            background_color=hex_color((0.4, 0.4, 0.4, 1)),
-            on_press=lambda x: self.dismiss()
+        # Keypad Grid
+        grid = GridLayout(cols=3, spacing=10, size_hint_y=1)
+        
+        # Keys 1-9
+        for i in range(1, 10):
+            btn = Button(
+                text=str(i),
+                font_size='24sp',
+                bold=True,
+                background_color=hex_color(COLOR_BUTTON_NORMAL),
+                color=hex_color(COLOR_TEXT_LIGHT),
+                background_normal=''
+            )
+            btn.bind(on_press=self.on_key_press)
+            grid.add_widget(btn)
+        
+        # Bottom Row: CLEAR, 0, OK
+        clear_btn = Button(
+            text='CLR',
+            font_size='20sp',
+            bold=True,
+            background_color=hex_color(COLOR_ALERT_RED),
+            color=hex_color((1, 1, 1, 1)), # White text for Red button
+            background_normal=''
         )
+        clear_btn.bind(on_press=self.on_clear)
+        grid.add_widget(clear_btn)
+        
+        zero_btn = Button(
+            text='0',
+            font_size='24sp',
+            bold=True,
+            background_color=hex_color(COLOR_BUTTON_NORMAL),
+            color=hex_color(COLOR_TEXT_LIGHT),
+            background_normal=''
+        )
+        zero_btn.bind(on_press=self.on_key_press)
+        grid.add_widget(zero_btn)
+        
         ok_btn = Button(
-            text='Set Count',
-            background_color=hex_color(COLOR_HIGHLIGHT),
-            on_press=self.confirm
+            text='OK',
+            font_size='20sp',
+            bold=True,
+            background_color=hex_color(COLOR_STATUS_GREEN),
+            color=hex_color((1, 1, 1, 1)), # White text for Green button
+            background_normal=''
         )
-        
-        btn_layout.add_widget(cancel_btn)
-        btn_layout.add_widget(ok_btn)
+        ok_btn.bind(on_press=self.confirm)
+        grid.add_widget(ok_btn)
         
         layout.add_widget(title)
-        layout.add_widget(input_box)
-        layout.add_widget(self.error_label)
-        layout.add_widget(btn_layout)
+        layout.add_widget(self.display_label)
+        layout.add_widget(grid)
+        
+        # Cancel Button at very bottom
+        cancel_btn = Button(
+            text='CANCEL',
+            size_hint_y=None,
+            height=50,
+            font_size='16sp',
+            background_color=hex_color((0.4, 0.4, 0.4, 1)),
+            background_normal='',
+            on_press=lambda x: self.dismiss()
+        )
+        layout.add_widget(cancel_btn)
         
         self.add_widget(layout)
     
-    def show_error(self, message):
-        self.error_label.text = f" {message}"
-    
-    def clear_error(self):
-        self.error_label.text = ''
+    def on_key_press(self, instance):
+        if self.reset_input:
+            self.current_value = instance.text
+            self.reset_input = False
+        else:
+            if self.current_value == '0':
+                self.current_value = instance.text
+            else:
+                if len(self.current_value) < 2: # Limit to 2 digits (max 99)
+                    self.current_value += instance.text
+        self.display_label.text = self.current_value
+        
+    def on_clear(self, instance):
+        self.current_value = '0'
+        self.reset_input = True # Allow fresh start after clear
+        self.display_label.text = self.current_value
     
     def confirm(self, instance):
-        self.clear_error()
         try:
-            count = int(self.input_field.text)
-            if count < MIN_KEG_COUNT:
-                self.show_error(f"Count must be at least {MIN_KEG_COUNT}")
-                return
-            if count > MAX_KEG_COUNT:
-                self.show_error(f"Count cannot exceed {MAX_KEG_COUNT}")
-                return
-            self.on_confirm(count)
-            self.dismiss()
+            count = int(self.current_value)
+            if count > 0:
+                self.on_confirm(count)
+                self.dismiss()
+            else:
+                 # Provide Feedback: Shake or Toast? Since this is a modal, label flash is easiest
+                 original_text = self.display_label.text
+                 self.display_label.text = "INVALID (>0)"
+                 self.display_label.color = hex_color(COLOR_ALERT_RED)
+                 
+                 def reset_display(dt):
+                     self.display_label.text = self.current_value
+                     self.display_label.color = hex_color(COLOR_TEXT_LIGHT)
+                 
+                 Clock.schedule_once(reset_display, 1)
         except ValueError:
-            self.show_error("Please enter a valid number")
+            pass
 
 class BatchModal(ModalView):
     def __init__(self, on_confirm, current_batch, **kwargs):
         super().__init__(**kwargs)
         self.size_hint = (0.6, 0.55)
-        self.background_color = hex_color((0, 0, 0, 0.85))
+        self.background_color = hex_color((1, 1, 1, 0.95))
         self.on_confirm = on_confirm
         
         layout = BoxLayout(orientation='vertical', padding=20, spacing=12)
+        with layout.canvas.before:
+            Color(0.95, 0.95, 0.95, 1)  # Solid light background
+            self.rect = Rectangle(pos=layout.pos, size=layout.size)
+        layout.bind(pos=lambda *x: setattr(self.rect, 'pos', layout.pos))
+        layout.bind(size=lambda *x: setattr(self.rect, 'size', layout.size))
         
         # Title
         title = Label(
@@ -335,7 +423,7 @@ class BatchModal(ModalView):
             font_size='18sp',
             halign='center',
             write_tab=False,
-            background_color=hex_color((0.2, 0.2, 0.2, 1)),
+            background_color=hex_color((0.95, 0.95, 0.95, 1)),
             foreground_color=hex_color(COLOR_TEXT_LIGHT),
             cursor_color=hex_color(COLOR_HIGHLIGHT),
             size_hint_y=None,
@@ -432,12 +520,15 @@ class SimpleKegHMI(BoxLayout):
         
         Window.clearcolor = COLOR_BG_DARK
         
+        main_logger.info("Initializing SimpleKegHMI...")
+        
         # Initialize components
         self.camera = None
         self.database = DatabaseManager()
         self.api_sender = APISender()
-        self.keg_detector = KegDetector()
-        self.qr_detector = QRDetector()
+        # Initialize QR Detector (lazy loaded)
+        QRDetectorClass = get_qr_detector_class()
+        self.qr_detector = QRDetectorClass()
         
         # Async Detection Setup
         self.detector_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LiveDetector")
@@ -453,10 +544,33 @@ class SimpleKegHMI(BoxLayout):
         self.current_count = 0
         self.prev_count = 0
         self.stability_counter = 0
-        self.is_auto_mode = False  # Start with manual mode by default
+        self.is_auto_mode = True  # Start with auto mode by default
         self.processing = False
+        self.auto_confirm_pending = False
+        self.auto_pending_frame = None  # Store frame during confirmation dialog
+        self.auto_capture_cooldown = False
         self.beer_types = ["Loading..."]  # Wait for API
         self.beer_type_map = {} # Mapping name -> id
+        
+        # === PERFORMANCE OPTIMIZATIONS ===
+        # Reusable texture for preview (avoids creating new texture every frame)
+        self._preview_texture = None
+        self._texture_size = (0, 0)
+        
+        # Data ready for sending state
+        self.data_ready_to_send = False
+        self._pending_capture = None
+        
+        # Performance tracking
+        self._frame_times = []
+        self._last_perf_log = time.time()
+        
+        # Detection resize (process smaller frames for faster detection)
+        # This doesn't affect preview - preview shows full resolution
+        # NOTE: Set to None to use full 4K resolution for maximum detection accuracy
+        self._detection_resize = None  # Full 4K - no resize, best accuracy
+        
+        main_logger.info("Performance optimizations enabled: texture reuse, full 4K detection")
 
 
         # Load last batch number
@@ -471,8 +585,8 @@ class SimpleKegHMI(BoxLayout):
         # Start systems
         self.start_detection_system()
         
-        # Schedule tasks
-        Clock.schedule_interval(self.update_frame, 1.0 / 20.0)  # Reduced for performance
+        # Schedule tasks - Preview at 30 FPS for smooth display
+        Clock.schedule_interval(self.update_frame, 1.0 / 30.0)  # 30 FPS for smooth preview
         Clock.schedule_interval(self.check_network, 30)
         Clock.schedule_interval(self.update_filling_date, 60)  # Update filling date every minute
         Clock.schedule_once(self.recover_batches, 1)
@@ -543,31 +657,18 @@ class SimpleKegHMI(BoxLayout):
             halign='right'
         )
         
-        # Detected count removed as per user request
-        # Keeping self.current_display as dummy to avoid breaking update logic?
-        # Better to just update logic or create a hidden/dummy label if referenced elsewhere.
-        # Searching indicates it IS referenced in update_ui.
-        
-        # Let's check where self.current_display is used.
-        # It is updated in update_ui loop. 
-        # I will create a dummy object or just remove the reference later?
-        # Safest is to keep the variable but not add it to layout, 
-        # OR create a dummy Label that isn't added.
-        
         self.current_display = Label(opacity=0) # Dummy
         
         status_box.add_widget(target_label)
         status_box.add_widget(self.target_display)
-        # status_box.add_widget(detected_label) # Removed
-        # status_box.add_widget(self.current_display) # Removed from layout
         
         left_panel.add_widget(status_box)
         
         # Right panel - Controls (40%)
         right_panel = BoxLayout(orientation='vertical', size_hint_x=0.4, spacing=10)
         
-        # Mode selector
-        mode_box = BoxLayout(orientation='vertical', size_hint_y=None, height=60, spacing=5)
+        # Mode selector - Larger buttons
+        mode_box = BoxLayout(orientation='vertical', size_hint_y=None, height=80, spacing=5)
         mode_label = Label(
             #text='OPERATION MODE:',
             font_size='12sp',
@@ -580,20 +681,21 @@ class SimpleKegHMI(BoxLayout):
         self.auto_btn = ToggleButton(
             text='AUTO',
             group='mode',
-            state='normal',
+            state='down',
             font_size='14sp',
             background_normal='',
-            background_color=hex_color(COLOR_BUTTON_NORMAL)
+            color=hex_color(COLOR_TEXT_LIGHT),
+            background_color=hex_color(COLOR_HIGHLIGHT)
         )
         self.auto_btn.bind(on_press=self.set_auto_mode)
         
         self.manual_btn = ToggleButton(
             text='MANUAL',
             group='mode',
-            state='down',
+            state='normal',
             font_size='14sp',
             background_normal='',
-            background_color=hex_color(COLOR_HIGHLIGHT)
+            background_color=hex_color(COLOR_BUTTON_NORMAL)
         )
         self.manual_btn.bind(on_press=self.set_manual_mode)
         
@@ -604,89 +706,97 @@ class SimpleKegHMI(BoxLayout):
         mode_box.add_widget(mode_buttons)
         right_panel.add_widget(mode_box)
         
-        # Configuration panel
-        config_box = GridLayout(cols=2, rows=4, spacing=5, size_hint_y=None, height=200)
+        # --- CONFIGURATION PANEL (UPDATED FOR SYMMETRY) ---
+        config_box = GridLayout(cols=2, rows=4, spacing=10, size_hint_y=None, height=350)
         
-        # Beer type
-        beer_label = Label(
-            text='BEER TYPE:',
-            font_size='12sp',
-            color=hex_color(COLOR_TEXT_LIGHT),
-            halign='left'
-        )
+        # Helper for symmetric styling
+        def create_config_label(text):
+            return Button(
+                text=text,
+                font_size='16sp',
+                bold=True,
+                color=hex_color(COLOR_HIGHLIGHT),
+                background_color=hex_color(COLOR_BUTTON_NORMAL),
+                background_normal='',
+                size_hint_x=0.5
+            )
+
+        # 1. Beer Type
+        config_box.add_widget(create_config_label('BEER TYPE:'))
+        
         self.beer_display = Spinner(
             text='Loading...',
             values=[],
-            font_size='14sp',
+            font_size='16sp',
+            bold=True,  # Match label
+            color=hex_color(COLOR_HIGHLIGHT), # Match label color
             background_color=hex_color(COLOR_BUTTON_NORMAL),
             background_normal='',
+            size_hint_x=0.5,
             option_cls=lambda **kwargs: Button(
                 **kwargs, 
                 size_hint_y=None, 
-                height=40, 
+                height=50,
+                font_size='16sp',
                 background_color=hex_color(COLOR_PANEL_BG),
+                color=hex_color(COLOR_TEXT_LIGHT),
                 background_normal=''
             )
         )
         self.beer_display.bind(text=self.on_beer_type_select)
+        config_box.add_widget(self.beer_display)
         
-        # Target count button
-        count_label = Label(
-            text='TARGET COUNT:',
-            font_size='12sp',
-            color=hex_color(COLOR_TEXT_LIGHT),
-            halign='left'
-        )
+        # 2. Target Count
+        config_box.add_widget(create_config_label('TARGET COUNT:'))
+        
         self.count_button = Button(
             text=str(self.required_keg_count),
-            font_size='14sp',
+            font_size='24sp', # Value slightly larger for emphasis, but box same
+            bold=True,
             background_color=hex_color(COLOR_BUTTON_NORMAL),
+            color=hex_color(COLOR_HIGHLIGHT), # Match label color
             background_normal='',
+            size_hint_x=0.5,
             on_press=self.change_count
         )
+        config_box.add_widget(self.count_button)
         
-        # Batch input - Use last batch number
-        batch_label = Label(
-            text='BATCH NO:',
-            font_size='12sp',
-            color=hex_color(COLOR_TEXT_LIGHT),
-            halign='left'
-        )
+        # 3. Batch Number
+        config_box.add_widget(create_config_label('BATCH NO:'))
+        
         self.batch_display = Button(
             text=self.last_batch_number,
-            font_size='14sp',
+            font_size='16sp',
+            bold=True,
             background_color=hex_color(COLOR_BUTTON_NORMAL),
+            color=hex_color(COLOR_HIGHLIGHT), # Match label color
             background_normal='',
+            size_hint_x=0.5,
             on_press=self.edit_batch
         )
-        
-        config_box.add_widget(beer_label)
-        config_box.add_widget(self.beer_display)
-        config_box.add_widget(count_label)
-        config_box.add_widget(self.count_button)
-        config_box.add_widget(batch_label)
         config_box.add_widget(self.batch_display)
         
-        # Filling Date/Time display (auto-populated, styled like other buttons)
-        filling_label = Label(
-            text='FILLING DATE:',
-            font_size='12sp',
-            color=hex_color(COLOR_TEXT_LIGHT),
-            halign='left'
-        )
+        # 4. Filling Date
+        config_box.add_widget(create_config_label('FILLING DATE:'))
+        
         self.filling_date_display = Button(
             text=datetime.now().strftime('%d-%m-%Y %H:%M'),
-            font_size='14sp',
+            font_size='16sp',
+            bold=True,
             background_color=hex_color(COLOR_BUTTON_NORMAL),
-            background_normal=''
+            color=hex_color(COLOR_HIGHLIGHT), # Match label color
+            background_normal='',
+            size_hint_x=0.5
         )
-        config_box.add_widget(filling_label)
         config_box.add_widget(self.filling_date_display)
         
-        right_panel.add_widget(config_box)
+
         
-        # Status indicator
-        status_box = BoxLayout(orientation='vertical', spacing=5, size_hint_y=None, height=60)
+        right_panel.add_widget(config_box)
+        # -----------------------------------------------------------
+        
+        # Status indicator - Reduced height to save space
+        status_box = BoxLayout(orientation='vertical', spacing=3, size_hint_y=None, height=40)
         
         self.status_label = Label(
             text='',
@@ -709,13 +819,13 @@ class SimpleKegHMI(BoxLayout):
         status_box.add_widget(self.status_label)
         status_box.add_widget(self.duplicate_warning)
         
-        # STATUS DISPLAY AREA - For showing pallet ID (reduced height)
+        # STATUS DISPLAY AREA - For showing pallet ID (compact)
         status_display_box = BoxLayout(
             orientation='vertical',
             size_hint_y=None,
-            height=70,
-            spacing=2,
-            padding=[5, 2, 5, 2]
+            height=55,
+            spacing=1,
+            padding=[5, 1, 5, 1]
         )
 
         # Success Message (for pallet creation)
@@ -766,12 +876,69 @@ class SimpleKegHMI(BoxLayout):
         # Initialize as empty
         self.clear_status_display()
         
-        # Action buttons
-        action_grid = GridLayout(cols=2, rows=2, spacing=5, size_hint_y=None, height=100)
+        # === PROCESS STATUS DISPLAY ===
+        process_status_box = BoxLayout(orientation='vertical', size_hint_y=None, height=70, spacing=2, padding=[5, 5, 5, 5])
+        with process_status_box.canvas.before:
+            Color(0.12, 0.14, 0.18, 1)  # Dark background
+            self._process_bg = Rectangle(pos=process_status_box.pos, size=process_status_box.size)
+        process_status_box.bind(pos=lambda i, v: setattr(self._process_bg, 'pos', v))
+        process_status_box.bind(size=lambda i, v: setattr(self._process_bg, 'size', v))
+        
+        self.process_title = Label(
+            text='PROCESS STATUS',
+            font_size='11sp',
+            color=(0.6, 0.6, 0.6, 1),
+            size_hint_y=None,
+            height=16,
+            halign='center'
+        )
+        
+        self.process_status_label = Label(
+            text='⏳ Waiting for kegs...',
+            font_size='14sp',
+            bold=True,
+            color=(0.5, 0.8, 1, 1),
+            size_hint_y=None,
+            height=24,
+            halign='center'
+        )
+        
+        self.process_detail_label = Label(
+            text='Place kegs under camera',
+            font_size='11sp',
+            color=(0.7, 0.7, 0.7, 1),
+            size_hint_y=None,
+            height=18,
+            halign='center'
+        )
+        
+        process_status_box.add_widget(self.process_title)
+        process_status_box.add_widget(self.process_status_label)
+        process_status_box.add_widget(self.process_detail_label)
+        right_panel.add_widget(process_status_box)
+        
+        # === SEND TO SERVER BUTTON (Large, prominent) ===
+        self.send_btn = Button(
+            text='📤  SEND TO SERVER',
+            font_size='20sp',
+            bold=True,
+            background_normal='',
+            background_color=(0.3, 0.3, 0.35, 1),  # Grey when disabled
+            color=(0.5, 0.5, 0.5, 1),
+            size_hint_y=None,
+            height=60,
+            disabled=True
+        )
+        self.send_btn.bind(on_press=self.send_to_server)
+        right_panel.add_widget(self.send_btn)
+        
+        # Action buttons - Smaller grid now
+        action_grid = GridLayout(cols=4, rows=1, spacing=8, size_hint_y=None, height=50)
         
         sync_btn = Button(
             text='SYNC',
-            font_size='12sp',
+            font_size='16sp',
+            bold=True,
             background_color=hex_color(COLOR_STATUS_BLUE),
             background_normal='',
             on_press=lambda x: self.sync_cloud()
@@ -779,17 +946,20 @@ class SimpleKegHMI(BoxLayout):
         
         logs_btn = Button(
             text='LOGS',
-            font_size='12sp',
+            font_size='16sp',
+            bold=True,
             background_color=hex_color(COLOR_BUTTON_NORMAL),
+            color=hex_color(COLOR_TEXT_LIGHT),
             background_normal='',
             on_press=self.show_logs
         )
         
         self.capture_btn = Button(
             text='CAPTURE',
-            font_size='14sp',
+            font_size='18sp',
             bold=True,
             background_color=hex_color(COLOR_BUTTON_NORMAL),
+            color=hex_color(COLOR_TEXT_LIGHT),
             background_normal='',
             disabled=True,
             on_press=self.force_capture
@@ -797,7 +967,8 @@ class SimpleKegHMI(BoxLayout):
         
         exit_btn = Button(
             text='EXIT',
-            font_size='12sp',
+            font_size='16sp',
+            bold=True,
             background_color=hex_color(COLOR_ALERT_RED),
             background_normal='',
             on_press=self.confirm_exit
@@ -848,6 +1019,18 @@ class SimpleKegHMI(BoxLayout):
         print(f"[SHOW_PALLET_CREATED] UI updated - success_display: '{self.success_display.text}'")
         print(f"[SHOW_PALLET_CREATED] UI updated - pallet_display: '{self.pallet_display.text}'")
         
+        # Show Success Popup
+        from kivy.uix.popup import Popup
+        content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        content.add_widget(Label(text="Successfully sent to server!", font_size='20sp', bold=True, color=hex_color(COLOR_STATUS_GREEN)))
+        content.add_widget(Label(text=f"Pallet ID: {pallet_id}", font_size='16sp'))
+        
+        popup = Popup(title='Success', content=content, size_hint=(0.6, 0.4))
+        popup.open()
+        
+        # Close popup automatically after 3 seconds
+        Clock.schedule_once(popup.dismiss, 3)
+        
         # Auto-clear after 30 seconds
         Clock.schedule_once(lambda dt: self.clear_status_display(), 30)
 
@@ -881,6 +1064,64 @@ class SimpleKegHMI(BoxLayout):
         self.success_display.opacity = 0.5
         self.pallet_display.opacity = 0.5
         self.batch_info_label.opacity = 0.5
+    
+    def update_process_status(self, status_type, main_text, detail_text=''):
+        """Update the process status display on home screen
+        
+        status_type: 'waiting', 'detecting', 'decoding', 'ready', 'sending', 'success', 'error'
+        """
+        status_config = {
+            'waiting': ('⏳', (0.5, 0.8, 1, 1)),      # Light blue
+            'detecting': ('🔍', (1, 0.85, 0.4, 1)),   # Yellow/orange
+            'decoding': ('📝', (0.9, 0.6, 1, 1)),     # Purple
+            'ready': ('✅', (0.3, 0.9, 0.4, 1)),      # Green
+            'sending': ('📤', (0.4, 0.7, 1, 1)),      # Blue
+            'success': ('✓', (0.2, 0.9, 0.3, 1)),    # Bright green
+            'error': ('❌', (0.9, 0.3, 0.3, 1)),      # Red
+        }
+        
+        icon, color = status_config.get(status_type, ('●', (0.7, 0.7, 0.7, 1)))
+        self.process_status_label.text = f'{icon} {main_text}'
+        self.process_status_label.color = color
+        self.process_detail_label.text = detail_text
+        
+        # Log the status update
+        self.add_log(f"Status: {main_text}")
+    
+    def _enable_send_button(self):
+        """Enable the SEND TO SERVER button with visual feedback"""
+        self.send_btn.disabled = False
+        self.send_btn.background_color = (0.2, 0.75, 0.35, 1)  # Vibrant green
+        self.send_btn.color = (1, 1, 1, 1)
+        self.send_btn.text = '📤  SEND TO SERVER'
+    
+    def _disable_send_button(self):
+        """Disable the SEND TO SERVER button"""
+        self.send_btn.disabled = True
+        self.send_btn.background_color = (0.3, 0.3, 0.35, 1)  # Grey
+        self.send_btn.color = (0.5, 0.5, 0.5, 1)
+        self.send_btn.text = '📤  SEND TO SERVER'
+    
+    def send_to_server(self, instance):
+        """Handle SEND TO SERVER button press"""
+        if not self.data_ready_to_send or not self._pending_capture:
+            self.show_toast("No data ready to send!", "error")
+            return
+        
+        # Disable button immediately to prevent double-clicks
+        self._disable_send_button()
+        self.data_ready_to_send = False
+        self.processing = True
+        
+        # Update status
+        batch = self._pending_capture.get('batch', 'Unknown')
+        self.update_process_status('sending', 'Sending to server...', f'Batch: {batch}')
+        
+        # Save current kegs to prevent re-triggering for same kegs
+        self.last_captured_qr_set = set(qr['data'] for qr in self.latest_qr_results) if self.latest_qr_results else set()
+        
+        # Submit the data
+        self._submit_pending_capture()
     
     def fetch_beer_types(self, dt=None):
         """Fetch beer types from cloud API (Background Thread)"""
@@ -942,6 +1183,108 @@ class SimpleKegHMI(BoxLayout):
         self.manual_btn.background_color = hex_color(COLOR_HIGHLIGHT)
         self.auto_btn.background_color = hex_color(COLOR_BUTTON_NORMAL)
         self.add_log("Manual mode: Set keg count manually")
+    
+    def show_auto_confirm_popup(self, frame):
+        """Show confirmation dialog before sending to API in Auto Mode"""
+        # Prevent multiple popups
+        if self.auto_confirm_pending:
+            return
+        
+        self.auto_confirm_pending = True
+        self.auto_pending_frame = frame.copy()  # Store the frame
+        
+        # Create modal
+        modal = ModalView(size_hint=(0.6, 0.4), auto_dismiss=False)
+        
+        content = BoxLayout(orientation='vertical', padding=20, spacing=15)
+        
+        # Store reference to background rectangle for updates
+        self._modal_bg_rect = None
+        with content.canvas.before:
+            Color(0.15, 0.15, 0.2, 1)
+            self._modal_bg_rect = Rectangle(pos=content.pos, size=content.size)
+        
+        # Bind to update background position/size when content changes
+        def update_bg(instance, value):
+            if self._modal_bg_rect:
+                self._modal_bg_rect.pos = instance.pos
+                self._modal_bg_rect.size = instance.size
+        content.bind(pos=update_bg, size=update_bg)
+        
+        # Title
+        title = Label(
+            text=f'[b]SEND TO API?[/b]',
+            markup=True,
+            font_size='22sp',
+            color=hex_color(COLOR_TEXT_LIGHT),
+            size_hint_y=0.3
+        )
+        
+        # Info
+        info = Label(
+            text=f'Detected {len(self.latest_qr_results)} QR codes.\nBatch: {self.batch_display.text}',
+            font_size='16sp',
+            color=hex_color(COLOR_TEXT_LIGHT),
+            size_hint_y=0.3,
+            halign='center'
+        )
+        
+        # Buttons
+        btn_box = BoxLayout(spacing=20, size_hint_y=0.4)
+        
+        yes_btn = Button(
+            text='YES - SEND',
+            font_size='18sp',
+            background_normal='',
+            background_color=hex_color(COLOR_STATUS_GREEN),
+            color=(1, 1, 1, 1)
+        )
+        
+        no_btn = Button(
+            text='NO - CANCEL',
+            font_size='18sp',
+            background_normal='',
+            background_color=hex_color(COLOR_ALERT_RED),
+            color=(1, 1, 1, 1)
+        )
+        
+        def on_yes(instance):
+            modal.dismiss()
+            self.auto_confirm_pending = False
+            if self.auto_pending_frame is not None:
+                main_logger.info("Auto-confirm: User approved, triggering capture")
+                self.trigger_capture(self.auto_pending_frame)
+                self.auto_pending_frame = None
+        
+        def on_no(instance):
+            modal.dismiss()
+            self.auto_confirm_pending = False
+            self.auto_pending_frame = None
+            self.stability_counter = 0  # Reset stability counter
+            main_logger.info("Auto-confirm: User cancelled")
+        
+        yes_btn.bind(on_press=on_yes)
+        no_btn.bind(on_press=on_no)
+        
+        btn_box.add_widget(yes_btn)
+        btn_box.add_widget(no_btn)
+        
+        content.add_widget(title)
+        content.add_widget(info)
+        content.add_widget(btn_box)
+        
+        modal.add_widget(content)
+        modal.open()
+        
+        # Play a sound or visual cue (optional)
+        self.show_toast("Confirm to send to API", "info", 2)
+    
+    def _update_modal_bg(self, widget):
+        """Helper to update modal background on resize"""
+        widget.canvas.before.clear()
+        with widget.canvas.before:
+            Color(0.15, 0.15, 0.2, 1)
+            Rectangle(pos=widget.pos, size=widget.size)
     
     def on_beer_type_select(self, spinner, text):
         """Handle beer type selection"""
@@ -1042,7 +1385,7 @@ class SimpleKegHMI(BoxLayout):
                         data = response.json()
                         # Parse configuration from response
                         keg_type = data.get("keg_type", "30L")
-                        count = KEG_TYPES.get(keg_type, {}).get('EUR Pallet', DEFAULT_KEG_COUNT)
+                        count = data.get("keg_count", DEFAULT_KEG_COUNT)
                         
                         # Apply updates on main thread
                         Clock.schedule_once(lambda dt: self._apply_sync_success(count, keg_type))
@@ -1072,102 +1415,166 @@ class SimpleKegHMI(BoxLayout):
         self.add_log(error_msg)
     
     def update_frame(self, dt):
-        """Update camera frame and process detection"""
+        """
+        Update camera frame and process detection.
+        OPTIMIZED: Uses background camera thread, reusable texture, and frame resize.
+        """
+        frame_start = time.perf_counter()
+        
         if not self.detection_active or not self.camera:
             # Show camera not initialized
             try:
-                # Create black frame (placeholder size 640x480)
                 img_h, img_w = 480, 640
                 vis_frame = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-                
-                # Draw text
                 text = "Camera Not Initialized"
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 1.0
-                thickness = 2
-                text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+                text_size = cv2.getTextSize(text, font, 1.0, 2)[0]
                 text_x = (img_w - text_size[0]) // 2
                 text_y = (img_h + text_size[1]) // 2
+                cv2.putText(vis_frame, text, (text_x, text_y), font, 1.0, (0, 0, 255), 2)
                 
-                # Red text
-                cv2.putText(vis_frame, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness)
-                
-                # Update preview
-                buf = cv2.flip(vis_frame, 0).tobytes()
-                texture = Texture.create(size=(img_w, img_h), colorfmt='bgr')
-                texture.blit_buffer(buf, colorfmt='bgr', bufferfmt='ubyte')
-                self.preview_image.texture = texture
-            except Exception:
-                pass
+                # Use reusable texture
+                self._update_preview_texture(vis_frame)
+            except Exception as e:
+                main_logger.warning(f"Preview error: {e}")
             return
 
         if self.processing:
             return
         
+        # === NON-BLOCKING: Get frame from background capture thread ===
         ret, frame = self.camera.get_frame()
-        if ret and frame is not None:
-            # Update preview
-            # Create visualization frame
-            vis_frame = frame.copy()
+        if not ret or frame is None:
+            main_logger.debug("No frame available")
+            return
+        
+        # Create visualization frame (reference, not copy for display)
+        vis_frame = frame.copy()
+        
+        # === ASYNC DETECTION with resized frame ===
+        try:
+            # 1. Check if previous detection finished
+            if self.current_detection_task and self.current_detection_task.done():
+                try:
+                    results = self.current_detection_task.result()
+                    if results:
+                        qr_list = results[0]  # Index 0 is the list of QRs
+                        # Scale bboxes back up if we resized
+                        if self._detection_resize and qr_list:
+                            orig_h, orig_w = frame.shape[:2]
+                            det_w, det_h = self._detection_resize
+                            scale_x = orig_w / det_w
+                            scale_y = orig_h / det_h
+                            for qr in qr_list:
+                                x1, y1, x2, y2 = qr['bbox']
+                                qr['bbox'] = (
+                                    int(x1 * scale_x), int(y1 * scale_y),
+                                    int(x2 * scale_x), int(y2 * scale_y)
+                                )
+                        self.latest_qr_results = qr_list
+                        if qr_list:
+                            main_logger.info(f"Detection result: {len(qr_list)} QR codes found - will draw bboxes")
+                            
+                            # === AUTO-TRIGGER LOGIC ===
+                            if self.is_auto_mode and not self.processing and not self.auto_confirm_pending:
+                                if len(qr_list) == self.required_keg_count:
+                                    self.stability_counter += 1
+                                    if self.stability_counter >= 5: # Stable for ~5 detection cycles
+                                        main_logger.info("Auto-trigger condition met! Capturing...")
+                                        self.trigger_capture(frame)
+                                        self.stability_counter = 0
+                                else:
+                                    self.stability_counter = 0
+                            # ==========================
+                except Exception as e:
+                    main_logger.warning(f"Detection result error: {e}")
+                finally:
+                    self.current_detection_task = None
+
+            # 2. Submit new detection if idle
+            if self.current_detection_task is None:
+                # === OPTIMIZATION: Resize frame for faster detection ===
+                if self._detection_resize:
+                    det_frame = cv2.resize(frame, self._detection_resize, interpolation=cv2.INTER_AREA)
+                else:
+                    det_frame = frame.copy()
+                
+                # Submit detection task (use_qreader=False for live preview)
+                self.current_detection_task = self.detector_executor.submit(
+                    self.qr_detector.detect_and_decode, 
+                    det_frame,
+                    False  # use_qreader=False for speed
+                )
+
+            # 3. Draw LATEST known results (Visual Feedback)
+            for qr in self.latest_qr_results:
+                x1, y1, x2, y2 = qr['bbox']
+                # Draw green boundary
+                cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                
+                # Draw text label background
+                label = qr['data'][:15] + '...' if len(qr['data']) > 15 else qr['data']
+                source = qr.get('source', 'unknown')
+                label_full = f"{label} [{source}]"
+                t_size = cv2.getTextSize(label_full, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(vis_frame, (x1, y1-25), (x1+t_size[0]+4, y1), (0, 255, 0), -1)
+                cv2.putText(vis_frame, label_full, (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        except Exception as e:
+            main_logger.warning(f"QR detection error: {e}")
+
+        # === OPTIMIZED: Update preview with reusable texture ===
+        self._update_preview_texture(vis_frame)
+        
+        # Process frame for keg detection logic
+        self.process_frame(frame)
+        
+        # === Performance logging ===
+        frame_time = (time.perf_counter() - frame_start) * 1000
+        self._frame_times.append(frame_time)
+        
+        # Log every 2 seconds
+        now = time.time()
+        if now - self._last_perf_log >= 2.0:
+            if self._frame_times:
+                avg_time = sum(self._frame_times) / len(self._frame_times)
+                fps = 1000 / avg_time if avg_time > 0 else 0
+                cam_fps = self.camera.get_fps() if hasattr(self.camera, 'get_fps') else 0
+                main_logger.info(f"UI FPS: {fps:.1f} | Frame time: {avg_time:.1f}ms | Camera FPS: {cam_fps:.1f}")
+                self._frame_times.clear()
+            self._last_perf_log = now
+
+    def _update_preview_texture(self, frame):
+        """
+        Update preview image texture efficiently.
+        REUSES texture object when size matches to avoid allocation overhead.
+        """
+        try:
+            h, w = frame.shape[:2]
             
-            # Detect and draw QR codes
-            try:
-                # Async Detection Logic - "Latest Frame Only" Strategy
-
-                # 1. Check if ANY previous detection finished
-                if self.current_detection_task and self.current_detection_task.done():
-                    try:
-                        # Get results (list of dicts, total_boxes)
-                        results = self.current_detection_task.result()
-                        if results:
-                            self.latest_qr_results = results[0] # Index 0 is the list of QRs
-                    except Exception as e:
-                        pass # Squelch errors to keep UI alive
-                    finally:
-                        self.current_detection_task = None
-
-                # 2. Submit new detection if idle
-                # Only submit if we are not currently processing a frame
-                if self.current_detection_task is None:
-                    # IMPORTANT: Pass a COPY of the frame to the thread to avoid memory race conditions
-                    # detector handles resizing internally
-                    self.current_detection_task = self.detector_executor.submit(
-                        self.qr_detector.detect_and_decode, 
-                        vis_frame.copy()
-                    )
-
-                # 3. Draw LATEST known results (Visual Feedback)
-                # This happens at clock speed (UI FPS), decoupled from detection speed
-                for qr in self.latest_qr_results:
-                    x1, y1, x2, y2 = qr['bbox']
-                    # Draw green boundary
-                    cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
-                    # Draw text label background
-                    label = qr['data'][:10] + '...' if len(qr['data']) > 10 else qr['data']
-                    t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-                    cv2.rectangle(vis_frame, (x1, y1-20), (x1+t_size[0], y1), (0, 255, 0), -1)
-                    cv2.putText(vis_frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-            except Exception as e:
-                pass
-                # self.add_log(f"QR Vis Error: {str(e)[:20]}")
-
-            # Update preview with visualization frame
-            buf = cv2.flip(vis_frame, 0).tobytes()
-            texture = Texture.create(size=(vis_frame.shape[1], vis_frame.shape[0]), colorfmt='bgr')
-            texture.blit_buffer(buf, colorfmt='bgr', bufferfmt='ubyte')
-            texture.flip_vertical()
-            self.preview_image.texture = texture
+            # Create or reuse texture
+            if self._preview_texture is None or self._texture_size != (w, h):
+                main_logger.debug(f"Creating new texture: {w}x{h}")
+                self._preview_texture = Texture.create(size=(w, h), colorfmt='bgr')
+                self._texture_size = (w, h)
             
-            # Process frame for keg detection
-            self.process_frame(frame)
+            # Flip frame for OpenGL coordinate system and blit
+            buf = cv2.flip(frame, 0).tobytes()
+            self._preview_texture.blit_buffer(buf, colorfmt='bgr', bufferfmt='ubyte')
+            self.preview_image.texture = self._preview_texture
+            
+        except Exception as e:
+            main_logger.warning(f"Texture update error: {e}")
+
     
     def process_frame(self, frame):
         """Process frame for keg detection"""
         try:
-            detection = self.keg_detector.detect(frame)
-            new_count = detection['count']
+            # detection = self.keg_detector.detect(frame)
+            # new_count = detection['count']
+            
+            # User Change: Rely ONLY on QR code count
+            new_count = len(self.latest_qr_results) if hasattr(self, 'latest_qr_results') else 0
             
             # Check stability
             if new_count == self.prev_count:
@@ -1185,14 +1592,40 @@ class SimpleKegHMI(BoxLayout):
             qr_count = len(self.latest_qr_results) if hasattr(self, 'latest_qr_results') else 0
             effective_count = max(self.current_count, qr_count)
             
-            # Auto-capture when stable, count matches rules, and not empty
+            # Auto-capture when stable, count EXACTLY matches target, and not empty
+            # USER REQUEST: Skip auto-capture confirmation, go directly to capture
+            # The API sending confirmation dialog will still show before sending to cloud
             if (self.is_auto_mode and
                 self.stability_counter >= STABILITY_THRESHOLD and 
                 not self.processing and 
                 not getattr(self, 'auto_confirm_pending', False) and
-                effective_count > 0 and
-                effective_count <= self.required_keg_count):
-                self.show_auto_capture_confirmation(frame)
+                not getattr(self, 'auto_capture_cooldown', False) and
+                qr_count > 0 and
+                qr_count == self.required_keg_count):
+                # Check if same kegs are still under camera (prevent double capture)
+                current_qr_set = set(qr['data'] for qr in self.latest_qr_results) if self.latest_qr_results else set()
+                should_capture = True
+                
+                if current_qr_set and self.last_captured_qr_set:
+                    overlap = len(current_qr_set & self.last_captured_qr_set)
+                    if overlap > 0 and overlap >= len(current_qr_set) * 0.5:
+                        should_capture = False
+                        self.duplicate_warning.text = "Same kegs detected - waiting for new pallet"
+                        self.duplicate_warning.color = hex_color(COLOR_STATUS_ORANGE)
+                
+                if should_capture:
+                    # Validate beer type
+                    if self.beer_display.text in ['Loading...', '', None]:
+                        self.show_toast("Please select a beer type first!", "error")
+                    # Validate batch number
+                    elif not self.batch_display.text.strip() or self.batch_display.text == 'BATCH-':
+                        self.show_toast("Please enter a valid batch number!", "error")
+                    else:
+                        # Direct capture - API confirmation will show before sending to cloud
+                        self.duplicate_warning.text = ""
+                        self.last_captured_qr_set = current_qr_set
+                        self.add_log("Target reached - capturing...")
+                        self.trigger_capture(frame)
                 
         except Exception as e:
             self.add_log(f"Detect error: {str(e)[:50]}")
@@ -1215,30 +1648,68 @@ class SimpleKegHMI(BoxLayout):
             self.system_status.color = hex_color(COLOR_STATUS_ORANGE)
             self.status_label.text = "Processing batch..."
             self.status_label.color = hex_color(COLOR_STATUS_ORANGE)
+        elif self.data_ready_to_send:
+            # Data is ready - waiting for user to click SEND
+            self.current_display.color = hex_color(COLOR_STATUS_GREEN)
+            self.system_status.text = '[b]● READY TO SEND[/b]'
+            self.system_status.color = hex_color(COLOR_STATUS_GREEN)
+            self.status_label.text = f"Data ready! Click SEND TO SERVER"
+            self.status_label.color = hex_color(COLOR_STATUS_GREEN)
         else:
             # Update status label based on detected vs target count
-            # Show effective count vs target in simple format
-            if effective_count < self.required_keg_count:
+            # Also update process status display
+            if effective_count == 0:
+                self.status_label.text = "Waiting for kegs..."
+                self.status_label.color = hex_color(COLOR_STATUS_BLUE)
+                self.system_status.text = '[b]● WAITING[/b]'
+                self.system_status.color = hex_color(COLOR_STATUS_BLUE)
+                # Update process status
+                if not hasattr(self, '_last_process_update') or self._last_process_update != 'waiting':
+                    self.process_status_label.text = '⏳ Waiting for kegs...'
+                    self.process_status_label.color = (0.5, 0.8, 1, 1)
+                    self.process_detail_label.text = 'Place kegs under camera'
+                    self._last_process_update = 'waiting'
+            elif effective_count < self.required_keg_count:
                 self.status_label.text = f"Target Not Achieved ({effective_count}/{self.required_keg_count})"
                 self.status_label.color = hex_color(COLOR_STATUS_ORANGE)
                 self.system_status.text = '[b]● DETECTING[/b]'
                 self.system_status.color = hex_color(COLOR_STATUS_BLUE)
+                # Update process status
+                if not hasattr(self, '_last_process_update') or self._last_process_update != 'detecting':
+                    self.process_status_label.text = f'🔍 Detecting... ({effective_count}/{self.required_keg_count})'
+                    self.process_status_label.color = (1, 0.85, 0.4, 1)
+                    self.process_detail_label.text = 'Scanning QR codes...'
+                    self._last_process_update = 'detecting'
+                else:
+                    # Just update the count
+                    self.process_status_label.text = f'🔍 Detecting... ({effective_count}/{self.required_keg_count})'
             elif effective_count == self.required_keg_count:
                 self.status_label.text = f"Target Achieved ({effective_count}/{self.required_keg_count})"
                 self.status_label.color = hex_color(COLOR_STATUS_GREEN)
                 self.system_status.text = '[b]● READY TO CAPTURE[/b]'
                 self.system_status.color = hex_color(COLOR_STATUS_GREEN)
+                # Update process status
+                if not hasattr(self, '_last_process_update') or self._last_process_update != 'target_met':
+                    self.process_status_label.text = f'📝 Decoding QR codes...'
+                    self.process_status_label.color = (0.9, 0.6, 1, 1)
+                    self.process_detail_label.text = f'{effective_count} kegs detected, processing...'
+                    self._last_process_update = 'target_met'
             else:  # effective_count > required_keg_count
                 self.status_label.text = f"WARNING: Count exceeds target! ({effective_count}/{self.required_keg_count})"
                 self.status_label.color = hex_color(COLOR_ALERT_RED)
                 self.system_status.text = '[b]● CHECK COUNT[/b]'
                 self.system_status.color = hex_color(COLOR_ALERT_RED)
+                # Update process status
+                self.process_status_label.text = f'⚠️ Too many kegs ({effective_count}/{self.required_keg_count})'
+                self.process_status_label.color = (0.9, 0.3, 0.3, 1)
+                self.process_detail_label.text = 'Remove extra kegs'
+                self._last_process_update = 'error'
             
         # Button Logic - Override for Manual Mode
         if not self.processing:
             if not self.is_auto_mode:
-                # Manual Mode: Enable capture ONLY if we see kegs OR QR codes
-                if effective_count > 0:
+                # Manual Mode: Enable capture ONLY if we see EXACTLY the target count
+                if effective_count == self.required_keg_count:
                     self.capture_btn.disabled = False
                     self.capture_btn.background_color = hex_color(COLOR_HIGHLIGHT)
                 else:
@@ -1248,109 +1719,43 @@ class SimpleKegHMI(BoxLayout):
                 # Auto Mode: Capture button always disabled - use auto-trigger only
                 self.capture_btn.disabled = True
                 self.capture_btn.background_color = hex_color(COLOR_BUTTON_NORMAL)
+                
+                # Auto Trigger Logic
+                if not self.auto_confirm_pending and effective_count == self.required_keg_count:
+                    # Check if we should auto-trigger
+                    # Needs to be stable for X frames
+                    self.stability_counter += 1
+                    if self.stability_counter > 15: # Approx 0.5s at 30fps
+                         # Check if same kegs detection logic (prevent double capture)
+                         current_qr_set = set(qr['data'] for qr in self.latest_qr_results) if self.latest_qr_results else set()
+                         should_capture = True
+                         
+                         if current_qr_set and self.last_captured_qr_set:
+                             overlap = len(current_qr_set & self.last_captured_qr_set)
+                             if overlap > 0 and overlap >= len(current_qr_set) * 0.5:
+                                 should_capture = False
+                                 self.duplicate_warning.text = "Wait for new pallet..."
+                                 self.duplicate_warning.color = hex_color(COLOR_STATUS_ORANGE)
+                         
+                         if should_capture:
+                             self.duplicate_warning.text = ""
+                             self.add_log("Auto-triggering capture...")
+                             self.last_captured_qr_set = current_qr_set
+                             self.trigger_capture(frame_resized) # Capture directly
+                             self.stability_counter = 0 # Reset
+                else:
+                    self.stability_counter = 0 # Reset if count doesn't match
 
-        # Progress bar removed - stability counter still tracked internally for auto-capture
     
-    def show_auto_capture_confirmation(self, frame):
-        """Show confirmation dialog for auto-capture (AUTO mode)"""
-        # Prevent multiple dialogs
-        if getattr(self, 'auto_confirm_pending', False):
-            return
-        
-        # Check cooldown - prevent rapid re-triggering after cancel or capture
-        if getattr(self, 'auto_capture_cooldown', False):
-            return
-        
-        # Check if same kegs are still under camera (compare QR codes)
-        current_qr_set = set(qr['data'] for qr in self.latest_qr_results) if self.latest_qr_results else set()
-        if current_qr_set and self.last_captured_qr_set:
-            # Check overlap - if more than 50% match, same kegs are still there
-            overlap = len(current_qr_set & self.last_captured_qr_set)
-            if overlap > 0 and overlap >= len(current_qr_set) * 0.5:
-                # Same kegs still under camera - don't trigger
-                self.duplicate_warning.text = "Same kegs detected - waiting for new pallet"
-                self.duplicate_warning.color = hex_color(COLOR_STATUS_ORANGE)
-                return
-        
-        # Validate beer type
-        if self.beer_display.text in ['Loading...', '', None]:
-            self.show_toast("Please select a beer type first!", "error")
-            return
-        
-        # Validate batch number
-        batch = self.batch_display.text.strip()
-        if not batch or batch == 'BATCH-':
-            self.show_toast("Please enter a valid batch number!", "error")
-            return
-        
-        # Check for duplicate batch number
-        is_duplicate, prev_session = self.database.is_batch_number_sent(batch)
-        if is_duplicate:
-            # In auto mode: show warning and do NOT show popup
-            # Operator needs to change batch number manually
-            self.duplicate_warning.text = f"DUPLICATE: {batch} already sent!"
-            self.duplicate_warning.color = hex_color(COLOR_ALERT_RED)
-            self.status_label.text = "Change batch number to continue"
-            self.status_label.color = hex_color(COLOR_STATUS_ORANGE)
-            self.stability_counter = 0  # Reset to avoid re-trigger immediately
-            self.add_log(f"Duplicate batch {batch} - auto-skipped")
-            # Don't show popup, just return
-            return
-        
-        # Clear any previous duplicate warning
-        self.duplicate_warning.text = ''
-        
-        self.auto_confirm_pending = True
-        beer_type = self.beer_display.text
-        # Use target count (user-entered) for confirmation, not detected count
-        # Detection triggers the capture, but target count represents expected kegs in pallet
-        message = f"Auto-capture {self.required_keg_count} kegs?\n\nBeer Type: {beer_type}\nBatch: {batch}"
-        
-        # Store frame for capture
-        self._pending_frame = frame.copy()
-        
-        def start_cooldown():
-            """Start cooldown timer to prevent immediate re-trigger"""
-            self.auto_capture_cooldown = True
-            self.add_log("Auto-capture cooldown: 10 seconds")
-            # Clear cooldown after 10 seconds
-            Clock.schedule_once(lambda dt: setattr(self, 'auto_capture_cooldown', False), 10)
-        
-        def on_confirm():
-            self.auto_confirm_pending = False
-            if hasattr(self, '_pending_frame') and self._pending_frame is not None:
-                # Save current QR codes for same-keg detection
-                self.last_captured_qr_set = set(qr['data'] for qr in self.latest_qr_results) if self.latest_qr_results else set()
-                self.show_toast("Capturing kegs...", "info")
-                self.trigger_capture(self._pending_frame)
-                self._pending_frame = None
-                # Start cooldown after successful capture
-                start_cooldown()
-        
-        def on_cancel():
-            self.auto_confirm_pending = False
-            self._pending_frame = None
-            self.stability_counter = 0  # Reset stability
-            # Start cooldown so popup doesn't immediately reappear
-            start_cooldown()
-            self.show_toast("Cancelled - waiting 10 seconds before next auto-capture", "info")
-        
-        modal = ConfirmationModal(
-            title="Confirm Auto-Capture",
-            message=message,
-            on_confirm=on_confirm,
-            on_cancel=on_cancel
-        )
-        modal.open()
     
     def trigger_capture(self, frame):
         """Trigger batch capture"""
-        print("\n" + "="*60)
-        print("TRIGGER_CAPTURE STARTED")
-        print("="*60)
+        main_logger.info("=" * 60)
+        main_logger.info("TRIGGER_CAPTURE STARTED")
+        main_logger.info("=" * 60)
         
         if self.processing:
-            print("  -> BLOCKED: Already processing")
+            main_logger.warning("BLOCKED: Already processing")
             return
         
         # Clear any previous status display
@@ -1365,141 +1770,211 @@ class SimpleKegHMI(BoxLayout):
         # Store user's batch for display in callbacks
         self.current_batch_number = batch
         
-        print(f"  Beer Name: {beer_name}")
-        print(f"  Beer ID: {beer_id}")
-        print(f"  Batch: {batch}")
-        print(f"  Required Keg Count: {self.required_keg_count}")
-        print(f"  Current Count: {self.current_count}")
+        main_logger.info(f"Beer Name: {beer_name}")
+        main_logger.info(f"Beer ID: {beer_id}")
+        main_logger.info(f"Batch: {batch}")
+        main_logger.debug(f"Required Keg Count: {self.required_keg_count}")
+        main_logger.debug(f"Current Count: {self.current_count}")
         
         if not batch:
-            print("  -> ERROR: Please enter batch number!")
+            main_logger.error("No batch number entered!")
             self.add_log("Please enter batch number!")
             return
         
-        print(f"\n[CAPTURE] Triggered! Beer: {beer_name} (ID: {beer_id}) | Batch: {batch}")
+        main_logger.info(f"[CAPTURE] Triggered! Beer: {beer_name} (ID: {beer_id}) | Batch: {batch}")
         self.processing = True
         self.add_log(f"Capturing {self.current_count} kegs...")
         
         # Save frame
         image_name = f"batch_{create_timestamp()}.jpg"
         frame_path = str(SAVE_FOLDER / image_name)
-        print(f"  -> Saving frame to: {frame_path}")
+        main_logger.debug(f"Saving frame to: {frame_path}")
         cv2.imwrite(frame_path, frame)
-        print(f"  -> Frame saved successfully")
+        main_logger.debug("Frame saved successfully")
         
         # Generate session ID
         session_id = f"BATCH_{self.database.get_next_batch_number():04d}"
-        print(f"  -> Session ID: {session_id}")
+        main_logger.info(f"Session ID: {session_id}")
+        
+        # Capture exact filling timestamp
+        filling_timestamp = datetime.now().strftime('%d-%m-%Y %H:%M:%S')
+        
+        # Store capture data - ready for sending
+        self._pending_capture = {
+            'frame_path': frame_path,
+            'image_name': image_name,
+            'session_id': session_id,
+            'beer_id': beer_id,
+            'batch': batch,
+            'filling_timestamp': filling_timestamp
+        }
+        
+        # Mark data as ready and enable SEND button
+        self.data_ready_to_send = True
+        self.processing = False  # Not processing anymore, waiting for user to click SEND
+        self._enable_send_button()
+        self.update_process_status('ready', f'Ready to send {self.required_keg_count} kegs', f'Batch: {batch} | Beer: {beer_name}')
+    
+    
+    def _submit_pending_capture(self):
+        """Submit the pending capture to API (after user confirmation)"""
+        capture_data = self._pending_capture
+        if not capture_data:
+            main_logger.error("No pending capture data!")
+            self.processing = False
+            return
         
         def process_capture():
-            print(f"\n{'='*60}")
-            print(f"PROCESS_CAPTURE THREAD STARTED")
-            print(f"{'='*60}")
-            print(f"  Session ID: {session_id}")
-            print(f"  Frame Path: {frame_path}")
-            print(f"  Image Name: {image_name}")
-            print(f"  Required Count: {self.required_keg_count}")
-            print(f"  Beer Type ID: {beer_id}")
-            print(f"  Batch: {batch}")
-            print(f"  -> Calling submit_batch...")
+            main_logger.info("=" * 60)
+            main_logger.info("PROCESS_CAPTURE THREAD STARTED (After Confirmation)")
+            main_logger.info("=" * 60)
             
             try:
-                # Capture exact filling timestamp
-                filling_timestamp = datetime.now().strftime('%d-%m-%Y %H:%M:%S')
-                print(f"  Filling Date: {filling_timestamp}")
-                
                 submit_batch(
-                    frame_path, image_name, session_id, self.required_keg_count,
-                    beer_type=beer_id, 
-                    batch=batch,
-                    filling_date=filling_timestamp
+                    capture_data['frame_path'], 
+                    capture_data['image_name'], 
+                    capture_data['session_id'], 
+                    self.required_keg_count,
+                    beer_type=capture_data['beer_id'], 
+                    batch=capture_data['batch'],
+                    filling_date=capture_data['filling_timestamp']
                 )
-                print(f"  -> submit_batch completed")
-                Clock.schedule_once(lambda dt: self.complete_capture(session_id), 3)
+                main_logger.info("submit_batch completed")
+                Clock.schedule_once(lambda dt: self.complete_capture(capture_data['session_id']), 3)
             except Exception as e:
-                print(f"  -> ERROR in submit_batch: {e}")
+                main_logger.error(f"ERROR in submit_batch: {e}")
                 import traceback
                 traceback.print_exc()
                 self.add_log(f"Capture error: {str(e)[:50]}")
                 Clock.schedule_once(lambda dt: self.capture_failed(), 0)
         
-        print("  -> Starting process_capture thread...")
+        main_logger.info("Starting process_capture thread...")
         threading.Thread(target=process_capture, daemon=True).start()
-        print("  -> Thread started")
+    
+    def _trigger_recapture(self):
+        """Trigger a recapture after cancel (auto-mode only)"""
+        if not self.is_auto_mode:
+            return
+        if self.processing or self.auto_confirm_pending:
+            return
+        main_logger.info("Auto-recapture triggered after 10s delay")
+        self.add_log("Auto-recapturing...")
+        self.stability_counter = 0  # Reset to start detection fresh
     
     def complete_capture(self, session_id):
         """Handle successful capture completion"""
         self.processing = False
         self.stability_counter = 0
+        self.data_ready_to_send = False
+        self._disable_send_button()
         
         # Use user's batch number for display
         user_batch = getattr(self, 'current_batch_number', session_id)
         self.show_status_message(f"Sent: {user_batch}", "success")
         self.show_toast(f"Batch {user_batch} submitted successfully!", "success")
         
+        # Update process status
+        self.process_status_label.text = '✓ Sent Successfully!'
+        self.process_status_label.color = (0.2, 0.9, 0.3, 1)
+        self.process_detail_label.text = f'Batch: {user_batch}'
+        self._last_process_update = 'success'
+        
+        # Reset process status after 5 seconds
+        Clock.schedule_once(lambda dt: self._reset_process_status(), 5)
+        
         self.add_log(f"Batch {user_batch} submitted")
-        Clock.schedule_once(lambda dt: self.check_status(session_id, user_batch), 3)
+        Clock.schedule_once(lambda dt: self.check_active_batch_status(session_id, user_batch), 1)
     
     def capture_failed(self):
         """Handle capture failure"""
         self.processing = False
         self.stability_counter = 0
+        self.data_ready_to_send = False
+        self._disable_send_button()
+        
         self.add_log("Capture failed - check logs")
         self.show_toast("Capture Failed! Check logs for details.", "error")
+        
+        # Update process status
+        self.process_status_label.text = '❌ Send Failed!'
+        self.process_status_label.color = (0.9, 0.3, 0.3, 1)
+        self.process_detail_label.text = 'Check logs for details'
+        self._last_process_update = 'error'
+        
+        # Reset process status after 5 seconds
+        Clock.schedule_once(lambda dt: self._reset_process_status(), 5)
     
-    def check_status(self, session_id, user_batch=None):
-        """Check batch status and show pallet confirmation"""
+    def _reset_process_status(self):
+        """Reset process status to waiting state"""
+        self.process_status_label.text = '⏳ Waiting for kegs...'
+        self.process_status_label.color = (0.5, 0.8, 1, 1)
+        self.process_detail_label.text = 'Place kegs under camera'
+        self._last_process_update = 'waiting'
+        self.duplicate_warning.text = ''
+    
+    def check_active_batch_status(self, session_id, user_batch=None, attempts=0):
+        """Poll batch status and show pallet confirmation when ready"""
         # Use user_batch for display, session_id for DB lookup
         display_batch = user_batch or session_id
-        print(f"\n[CHECK_STATUS] Checking status for: {session_id} (display: {display_batch})")
-        status = self.database.get_batch_status(session_id)
-        print(f"[CHECK_STATUS] Batch status: {status}")
+        # print(f"\n[CHECK_STATUS] Checking status for: {session_id} (Attempt {attempts+1})")
         
-        if status == 'api_failed':
+        status = self.database.get_batch_status(session_id)
+        # print(f"[CHECK_STATUS] Batch status: {status}")
+        
+        if status == 'api_sent':
+            # SUCCESS!
+            response_json = self.database.get_batch_response(session_id)
+            print(f"[CHECK_STATUS] API Response from DB: {response_json}")
+            
+            pallet_id = "UNKNOWN"
+            if response_json:
+                try:
+                    # Parse JSON response to get pallet ID
+                    import json
+                    resp_data = json.loads(response_json)
+                    # Adjust based on your actual API response structure
+                    # Example: {"palletId": "PAL-123", ...}
+                    pallet_id = resp_data.get('palletId', display_batch)
+                except:
+                    pallet_id = display_batch
+            
+            self.show_pallet_created(pallet_id, display_batch)
+            self.add_log(f"Batch {display_batch} sent successfully!")
+            return
+
+        elif status == 'api_failed':
+            # FAILURE
             self.add_log(f"Batch {display_batch} failed to send")
             self.show_status_message(f"Batch Failed: {display_batch}", "error")
             self.show_toast(f"API Error: Batch {display_batch} failed!", "error", 5)
-        elif status == 'api_sent':
-            # Get response to extract Pallet ID
-            response_json = self.database.get_batch_response(session_id)
-            print(f"[CHECK_STATUS] API Response from DB: {response_json}")
+            # Fetch error details if possible
+            # error_msg = self.database.get_last_error(session_id)
+            return
+
+        elif attempts > 60: # 30 seconds timeout (0.5s interval)
+            # TIMEOUT
+            self.add_log(f"Batch {display_batch} timed out (still processing)")
+            self.show_toast(f"Processing timed out for {display_batch}", "error")
+            return
+
+        else:
+            # STILL PROCESSING -> Poll again
+            Clock.schedule_once(lambda dt: self.check_active_batch_status(session_id, user_batch, attempts + 1), 0.5)
             
             # Auto-increment batch number for next run
             self.increment_batch_number()
             
-            if response_json:
-                try:
-                    data = json.loads(response_json)
-                    print(f"[CHECK_STATUS] Parsed JSON: {data}")
-                    pallet_id = data.get('paletteId') or data.get('palletId') or data.get('pallet_id') or data.get('id')
-                    print(f"[CHECK_STATUS] Extracted Pallet ID: {pallet_id}")
-                    
-                    if pallet_id:
-                        # Show in UI display prominently with user's batch
-                        print(f"[CHECK_STATUS] Calling show_pallet_created({pallet_id}, {display_batch})")
-                        self.show_pallet_created(pallet_id, display_batch)
-                        # Also log it
-                        self.add_log(f"Pallet Created: {pallet_id}")
-                        self.show_toast(f"Pallet Created: {pallet_id}", "success", 5)
-                    else:
-                        print("[CHECK_STATUS] No pallet_id found, showing success message")
-                        # Just show success message with user's batch
-                        self.show_status_message(f"Batch {display_batch} Sent", "success")
-                except Exception as e:
-                    print(f"[CHECK_STATUS] Error parsing response: {e}")
-                    self.show_status_message(f"Batch {display_batch} Sent", "success")
-            else:
-                print("[CHECK_STATUS] No response_json from DB")
-                self.show_status_message(f"Batch {display_batch} Sent", "success")
+            return
+
     
     def force_capture(self, instance):
         """Manual capture trigger with confirmation dialog"""
-        print("\n" + "="*60)
-        print("CAPTURE BUTTON CLICKED")
-        print("="*60)
-        print(f"  Processing: {self.processing}")
-        print(f"  Current Count: {self.current_count}")
-        print(f"  Required Count: {self.required_keg_count}")
+        main_logger.info("=" * 60)
+        main_logger.info("CAPTURE BUTTON CLICKED")
+        main_logger.info("=" * 60)
+        main_logger.debug(f"  Processing: {self.processing}")
+        main_logger.debug(f"  Current Count: {self.current_count}")
+        main_logger.debug(f"  Required Count: {self.required_keg_count}")
         
         # Validate inputs first
         if self.processing:
@@ -1537,15 +2012,15 @@ class SimpleKegHMI(BoxLayout):
         message = f"Capture {self.required_keg_count} kegs?\n\nBeer Type: {beer_type}\nBatch: {batch}{duplicate_warning}"
         
         def on_confirm():
-            print("  -> Confirmation received, getting frame...")
+            main_logger.info("Capture confirmed, getting frame...")
             ret, frame = self.camera.get_frame()
-            print(f"  -> Frame returned: ret={ret}, frame is None={frame is None}")
+            main_logger.debug(f"Frame acquired: ret={ret}, frame shape={frame.shape if frame is not None else 'None'}")
             if ret and frame is not None:
-                print("  -> Calling trigger_capture...")
+                main_logger.info("Triggering capture process...")
                 self.show_toast("Capturing kegs...", "info")
                 self.trigger_capture(frame)
             else:
-                print("  -> FAILED: Could not get frame from camera")
+                main_logger.error("Failed to get frame from camera")
                 self.show_toast("Camera error! Could not get frame.", "error")
         
         modal = ConfirmationModal(
@@ -1657,7 +2132,8 @@ class SimpleKegApp(App):
     def build(self):
         self.title = 'Keg Counting System'
         Window.clearcolor = COLOR_BG_DARK
-        Window.size = (1024, 600)  # Standard industrial display size
+        # Removed window size to allow full screen
+        # Window.size = (1024, 600)  
         return SimpleKegHMI()
     
     def on_stop(self):

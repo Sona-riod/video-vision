@@ -65,7 +65,7 @@ class APISender:
         
         # Retry thread
         self.retry_thread = None
-        self.running = False
+        self._stop_event = threading.Event()
         self.retry_interval = 60  # seconds
         
         # Start monitoring
@@ -419,7 +419,7 @@ class APISender:
         if self.retry_thread and self.retry_thread.is_alive():
             return
             
-        self.running = True
+        self._stop_event.clear()
         self.retry_thread = threading.Thread(
             target=self._retry_monitor_loop,
             name="API_Retry_Monitor",
@@ -430,16 +430,16 @@ class APISender:
 
     def stop_retry_monitor(self):
         """Stop retry monitor thread"""
-        self.running = False
+        self._stop_event.set()
         if self.retry_thread:
-            self.retry_thread.join(timeout=5)
+            self.retry_thread.join(timeout=2)
             self.logger.info("Retry monitor stopped")
 
     def _retry_monitor_loop(self):
         """Main loop for retry monitoring"""
         self.logger.info("Retry monitor loop started")
         
-        while self.running:
+        while not self._stop_event.is_set():
             try:
                 # Check network every interval
                 current_time = datetime.now()
@@ -451,12 +451,12 @@ class APISender:
                 if self.network_online:
                     self._process_retry_queue()
                 
-                # Sleep before next check
-                time.sleep(self.retry_interval)
+                # Sleep before next check (interruptible)
+                self._stop_event.wait(self.retry_interval)
                 
             except Exception as e:
                 self.logger.error(f"Retry monitor error: {e}")
-                time.sleep(60)  # Longer sleep on error
+                self._stop_event.wait(60)  # Longer sleep on error
 
     def _process_retry_queue(self):
         """Process batches in retry queue"""
