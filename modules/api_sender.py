@@ -14,6 +14,10 @@ import urllib3
 # Disable SSL warnings for development
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+HTTP_PREFIX = "http://"
+HTTPS_PREFIX = "https://"
+CONTENT_TYPE_JSON = "application/json"
+
 # Thread lock for database access
 db_lock = threading.RLock()
 
@@ -45,14 +49,14 @@ class APISender:
         )
         
         adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        self.session.mount(HTTP_PREFIX, adapter)
+        self.session.mount(HTTPS_PREFIX, adapter)
         
         # Set default headers
         self.session.headers.update({
             'User-Agent': 'KegDetectionSystem/1.0',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
+            'Accept': CONTENT_TYPE_JSON,
+            'Content-Type': CONTENT_TYPE_JSON
         })
         
         self.logger = logging.getLogger(__name__)
@@ -76,7 +80,7 @@ class APISender:
         """
         Fetch beer types from cloud API using the configured endpoint
         """
-        headers = {'Content-Type': 'application/json'}
+        headers = {'Content-Type': CONTENT_TYPE_JSON}
         payload = {"macId": CAMERA_MAC_ID}  # Exactly as cloud team specified
         
         try:
@@ -92,24 +96,7 @@ class APISender:
                     data = response.json()
                     self.logger.info(f"Raw response: {data}")
                     
-                    # Handle different response formats
-                    if isinstance(data, list):
-                        # check if it is a list of dictionaries
-                        if data and isinstance(data[0], dict):
-                             # Keep full object
-                             beer_types = data
-                        else:
-                             # Convert strings to objects if needed (fallback)
-                             beer_types = [{"name": x, "id": x} for x in data]
-                    elif isinstance(data, dict):
-                        # Try different possible keys
-                        raw_list = data.get("beer_types", data.get("types", data.get("beerTypes", [])))
-                        if raw_list and isinstance(raw_list[0], dict):
-                             beer_types = raw_list
-                        else:
-                             beer_types = [{"name": x, "id": x} for x in raw_list]
-                    else:
-                        beer_types = []
+                    beer_types = self._process_beer_types_response(data)
                     
                     if beer_types and len(beer_types) > 0:
                         self.logger.info(f"Successfully fetched {len(beer_types)} beer types")
@@ -135,6 +122,25 @@ class APISender:
         
         # If the configured endpoint fails, use fallback
         self.logger.error("Beer types endpoint failed.")
+        return []
+
+    def _process_beer_types_response(self, data):
+        """Helper to process beer types response data"""
+        if isinstance(data, list):
+            # check if it is a list of dictionaries
+            if data and isinstance(data[0], dict):
+                 # Keep full object
+                 return data
+            else:
+                 # Convert strings to objects if needed (fallback)
+                 return [{"name": x, "id": x} for x in data]
+        elif isinstance(data, dict):
+            # Try different possible keys
+            raw_list = data.get("beer_types", data.get("types", data.get("beerTypes", [])))
+            if raw_list and isinstance(raw_list[0], dict):
+                 return raw_list
+            else:
+                 return [{"name": x, "id": x} for x in raw_list]
         return []
 
     def send_batch(self, batch_id: str, qr_codes: list, payload: dict = None, **kwargs) -> bool:
@@ -203,29 +209,12 @@ class APISender:
         
         last_error = None
         
-        # Add payload hash for integrity if enabled
-        print("\nSTEP 2: Checking payload hash configuration...")
-        print(f"  ENABLE_PAYLOAD_HASH: {ENABLE_PAYLOAD_HASH}")
-        if ENABLE_PAYLOAD_HASH:
-            try:
-                data_string = json.dumps(payload, sort_keys=True)
-                payload['hash'] = hashlib.sha256(data_string.encode()).hexdigest()
-                print(f"  Hash added: {payload['hash'][:20]}...")
-                self.logger.debug(f"Added hash to payload for batch {batch_id}")
-            except Exception as e:
-                print(f"  ERROR adding hash: {e}")
-                self.logger.warning(f"Failed to add hash to payload: {e}")
-        else:
-            print("  Payload hash disabled, skipping...")
+        self._add_payload_hash(payload, batch_id)
         
         print("\nSTEP 3: Preparing HTTP headers...")
-        headers = {'Content-Type': 'application/json'}
-        print(f"  Headers: {headers}")
+        headers = {'Content-Type': CONTENT_TYPE_JSON}
         
-        print("\nSTEP 4: Preparing payload...")
-        print(f"  Payload keys: {list(payload.keys())}")
-        print(f"  Full Payload:")
-        print(json.dumps(payload, indent=4, default=str))
+        self._log_request_details(payload, headers)
         
         for attempt in range(start_attempt + 1, start_attempt + self.max_retries + 1):
             print(f"\n{'='*60}")
@@ -264,41 +253,7 @@ class APISender:
                 
                 # Check response
                 if response.status_code in [200, 201]:
-                    print(f"\nSTEP 8: SUCCESS - Status {response.status_code}")
-                    try:
-                        resp_data = response.json()
-                        pallet_id = resp_data.get('paletteId') or resp_data.get('palletId') or resp_data.get('id') or "Unknown"
-                        print(f"  Parsed JSON successfully")
-                        print(f"  Pallet ID: {pallet_id}")
-                        self.logger.info(f"Batch {batch_id} sent successfully. Pallet ID: {pallet_id}")
-                    except Exception as parse_err:
-                        print(f"  Could not parse JSON: {parse_err}")
-                        self.logger.info(f"Batch {batch_id} sent successfully (Status: {response.status_code})")
-                    
-                    # Update database status
-                    print("\nSTEP 9: Updating database status...")
-                    try:
-                        with db_lock:
-                            conn = sqlite3.connect(self.db_path, timeout=30)
-                            cur = conn.cursor()
-                            cur.execute('''
-                                UPDATE detection_sessions 
-                                SET batch_status = 'api_sent', 
-                                    api_response = ?,
-                                    last_api_attempt = ?
-                                WHERE session_id = ?
-                            ''', (response.text, datetime.now(), batch_id))
-                            conn.commit()
-                            conn.close()
-                        print("  Database updated successfully")
-                    except Exception as e:
-                        print(f"  ERROR updating database: {e}")
-                        self.logger.error(f"Failed to update success status: {e}")
-                    
-                    print("\n" + "="*60)
-                    print("API SEND COMPLETED SUCCESSFULLY")
-                    print("="*60 + "\n")
-                    return True
+                    return self._handle_success_response(response, batch_id)
                 else:
                     last_error = f"HTTP {response.status_code}: {response.text[:200]}"
                     print(f"\nSTEP 8: FAILURE - Status {response.status_code}")
@@ -306,29 +261,12 @@ class APISender:
                     self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
                     
             except requests.exceptions.SSLError as e:
-                print(f"\nSTEP 6: SSL ERROR")
-                print(f"  Error: {e}")
-                # Try HTTP fallback if HTTPS fails
-                if self.api_url.startswith("https://"):
-                    http_url = self.api_url.replace("https://", "http://")
-                    print(f"  Trying HTTP fallback: {http_url}")
-                    self.logger.info(f"SSL error, trying HTTP fallback: {http_url}")
-                    try:
-                        response = self.session.post(
-                            http_url,
-                            json=payload,
-                            headers=headers,
-                            timeout=self.timeout
-                        )
-                        if response.status_code in [200, 201]:
-                            print(f"  HTTP fallback SUCCESS!")
-                            self.logger.info(f"Batch {batch_id} sent via HTTP fallback")
-                            return True
-                    except Exception as fallback_err:
-                        print(f"  HTTP fallback failed: {fallback_err}")
-                
+                # SSL error handling
+                if self._attempt_http_fallback(e, batch_id, payload, headers):
+                     return True
                 last_error = f"SSL verification failed: {str(e)}"
                 self.logger.error(f"Batch {batch_id}: {last_error} (attempt {attempt})")
+                
             except requests.exceptions.Timeout:
                 last_error = "Request timeout"
                 print(f"\nSTEP 6: TIMEOUT ERROR")
@@ -353,6 +291,78 @@ class APISender:
                 time.sleep(wait_time)
         
         # Update error in database
+        self._log_error_to_db(batch_id, last_error)
+        
+        print("\n" + "="*60)
+        print("API SEND FAILED")
+        print("="*60 + "\n")
+        return False
+
+    def _add_payload_hash(self, payload, batch_id):
+        # Add payload hash for integrity if enabled
+        print("\nSTEP 2: Checking payload hash configuration...")
+        print(f"  ENABLE_PAYLOAD_HASH: {ENABLE_PAYLOAD_HASH}")
+        if ENABLE_PAYLOAD_HASH:
+            try:
+                data_string = json.dumps(payload, sort_keys=True)
+                payload['hash'] = hashlib.sha256(data_string.encode()).hexdigest()
+                print(f"  Hash added: {payload['hash'][:20]}...")
+                self.logger.debug(f"Added hash to payload for batch {batch_id}")
+            except Exception as e:
+                print(f"  ERROR adding hash: {e}")
+                self.logger.warning(f"Failed to add hash to payload: {e}")
+        else:
+            print("  Payload hash disabled, skipping...")
+
+    def _log_request_details(self, payload, headers):
+        print(f"  Headers: {headers}")
+        
+        print("\nSTEP 4: Preparing payload...")
+        print(f"  Payload keys: {list(payload.keys())}")
+        print(f"  Full Payload:")
+        print(json.dumps(payload, indent=4, default=str))
+
+    def _handle_success_response(self, response, batch_id):
+        print(f"\nSTEP 8: SUCCESS - Status {response.status_code}")
+        try:
+            resp_data = response.json()
+            pallet_id = resp_data.get('paletteId') or resp_data.get('palletId') or resp_data.get('id') or "Unknown"
+            print(f"  Parsed JSON successfully")
+            print(f"  Pallet ID: {pallet_id}")
+            self.logger.info(f"Batch {batch_id} sent successfully. Pallet ID: {pallet_id}")
+        except Exception as parse_err:
+            print(f"  Could not parse JSON: {parse_err}")
+            self.logger.info(f"Batch {batch_id} sent successfully (Status: {response.status_code})")
+        
+        self._update_db_success(response, batch_id)
+        
+        print("\n" + "="*60)
+        print("API SEND COMPLETED SUCCESSFULLY")
+        print("="*60 + "\n")
+        return True
+
+    def _update_db_success(self, response, batch_id):
+        # Update database status
+        print("\nSTEP 9: Updating database status...")
+        try:
+            with db_lock:
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                cur = conn.cursor()
+                cur.execute('''
+                    UPDATE detection_sessions 
+                    SET batch_status = 'api_sent', 
+                        api_response = ?,
+                        last_api_attempt = ?
+                    WHERE session_id = ?
+                ''', (response.text, datetime.now(), batch_id))
+                conn.commit()
+                conn.close()
+            print("  Database updated successfully")
+        except Exception as e:
+            print(f"  ERROR updating database: {e}")
+            self.logger.error(f"Failed to update success status: {e}")
+
+    def _log_error_to_db(self, batch_id, last_error):
         print("\nSTEP FINAL: All retries exhausted, updating error in database...")
         if last_error:
             print(f"  Last Error: {last_error}")
@@ -372,10 +382,29 @@ class APISender:
             except Exception as e:
                 print(f"  ERROR updating database: {e}")
                 self.logger.error(f"Failed to update error for {batch_id}: {e}")
+    
+    def _attempt_http_fallback(self, e, batch_id, payload, headers):
+        print(f"\nSTEP 6: SSL ERROR")
+        print(f"  Error: {e}")
+        # Try HTTP fallback if HTTPS fails
+        if self.api_url.startswith(HTTPS_PREFIX):
+            http_url = self.api_url.replace(HTTPS_PREFIX, HTTP_PREFIX)
+            print(f"  Trying HTTP fallback: {http_url}")
+            self.logger.info(f"SSL error, trying HTTP fallback: {http_url}")
+            try:
+                response = self.session.post(
+                    http_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout
+                )
+                if response.status_code in [200, 201]:
+                    print(f"  HTTP fallback SUCCESS!")
+                    self.logger.info(f"Batch {batch_id} sent via HTTP fallback")
+                    return True
+            except Exception as fallback_err:
+                print(f"  HTTP fallback failed: {fallback_err}")
         
-        print("\n" + "="*60)
-        print("API SEND FAILED")
-        print("="*60 + "\n")
         return False
 
     def _check_network_status(self):

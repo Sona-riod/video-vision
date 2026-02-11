@@ -616,7 +616,7 @@ class DatabaseManager:
         for row in results:
             try:
                 payload = json.loads(row[1])
-            except:
+            except Exception:
                 payload = {}
             
             retry_items.append({

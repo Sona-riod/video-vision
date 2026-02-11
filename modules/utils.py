@@ -79,7 +79,7 @@ def get_file_size_mb(file_path):
     """Get file size in MB"""
     try:
         return os.path.getsize(file_path) / (1024 * 1024)
-    except:
+    except Exception:
         return 0
 
 def safe_delete(file_path):

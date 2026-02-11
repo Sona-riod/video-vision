@@ -15,22 +15,16 @@ SAVE_FOLDER.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
-# Camera Configuration for Real-Time
-# Camera Configuration for Real-Time
+
+
+# Jetson Orin Configuration (Active)
 CAMERA_CONFIG = {
-    'type': 'webcam',    # PC Webcam
-    'device': 0,        # Default Value 0
-    'width': 1280,      # Standard Webcam Res
-    'height': 720,
+    'type': 'v4l2',    # Jetson typically uses v4l2
+    'device': 10,       # Default to 0 (Video0) - Adjust if using specific ID like 10
+    'width': 1408,     # ICAM-540 max resolution
+    'height': 1080,
     'fps': 30,
 }
-# CAMERA_CONFIG = {
-#     'type': 'v4l2',    # Jetson typically uses v4l2
-#     'device': 10,       # Default to 0 (Video0) - Adjust if using specific ID like 10
-#     'width': 1408,     # ICAM-540 max resolution
-#     'height': 1080,
-#     'fps': 30,
-# }
 
 
 # ========== API CONFIGURATION ==========
@@ -48,28 +42,7 @@ ENABLE_PAYLOAD_HASH = True
 CLOUD_CONFIG_ENDPOINT = f"{API_ENDPOINT}/api/current-config"
 CLOUD_SYNC_INTERVAL = 30
 
-# Keg Types and Pallet Configuration
-KEG_TYPES = {
-    "30L": {
-        "EUR Pallet": 6,
-        "Industrial Pallet": 8
-    },
-    "20L Slim": {
-        "EUR Pallet": 15,
-        "Industrial Pallet": 20
-    },
-    "Other": {
-        "EUR Pallet": 6,
-        "Industrial Pallet": 8
-    }
-}
 
-# Pallet types
-PALLET_TYPES = ["EUR Pallet", "Industrial Pallet"]
-
-# Default settings
-DEFAULT_KEG_TYPE = "30L"
-DEFAULT_PALLET_TYPE = "EUR Pallet"
 DEFAULT_KEG_COUNT = 6
 MAX_KEG_COUNT = 20
 MIN_KEG_COUNT = 1
@@ -83,6 +56,9 @@ MIN_OCCLUSION_THRESHOLD = 0.7
 KEG_MODEL_PATH = MODELS_DIR / "best.pt"
 QR_MODEL_PATH = MODELS_DIR / "model_qr" / "best.pt"
 QR_CONF_THRESHOLD = 0.5
+
+# Pallet Status options
+PALLET_STATUS = ["CREATED"]
 
 # ========== GPU CONFIGURATION ==========
 GPU_CONFIG = {
@@ -109,7 +85,7 @@ NETWORK_CHECK_INTERVAL = 30
 # Alarm System Configuration
 ALARM_BLINK_INTERVAL = 0.5
 ENABLE_PHYSICAL_ALERTS = False
-FOV_ENABLED = False # Enabled for production/Jetsons
+FOV_ENABLED = True # Enabled for production/Jetsons
 
 # Application Settings
 MAX_FOLDER_SIZE_MB = 500

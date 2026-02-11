@@ -1,18 +1,18 @@
-# modules/detector.py - Optimized QR Code Detection with Performance Logging
+# modules/detector.py - Optimized QR Code Detection with YOLO + Enhanced Crop Decoding
 """
-QR Detector using Pyzbar (fast) + QReader (robust) fallback chain.
-Optimized for Jetson Orin with:
-- Early exit on successful detection
-- Optional QReader for final capture only
-- Performance timing logs
+Fast QR Detector using YOLO for localization + Pyzbar for decoding.
+Optimized for:
+- Long-distance QR detection via YOLO model
+- Fast crop-only decoding (no full-frame scanning)
+- Enhanced preprocessing fallbacks (upscale + CLAHE + sharpening)
 """
 import cv2
 import numpy as np
 import threading
 from concurrent.futures import ThreadPoolExecutor
-import warnings
 import time
 import logging
+from pathlib import Path
 
 # Setup debug logger
 logger = logging.getLogger("QRDetector")
@@ -22,38 +22,10 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter('[%(name)s] %(levelname)s: %(message)s'))
     logger.addHandler(handler)
 
-# Performance timing helper
-def log_time(func):
-    """Decorator to log function execution time"""
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        elapsed = (time.perf_counter() - start) * 1000
-        logger.debug(f"{func.__name__} took {elapsed:.1f}ms")
-        return result
-    return wrapper
-
-# Suppress warnings during imports
-warnings.filterwarnings('ignore')
-
 # ===== INITIALIZATION =====
 print("\n" + "="*60)
-print("INITIALIZING QR DETECTOR (OPTIMIZED)")
+print("INITIALIZING QR DETECTOR (YOLO + ENHANCED DECODE)")
 print("="*60)
-
-# Check CUDA availability
-CUDA_AVAILABLE = False
-TORCH_AVAILABLE = False
-try:
-    import torch
-    TORCH_AVAILABLE = True
-    CUDA_AVAILABLE = torch.cuda.is_available()
-    print(f"[DETECTOR] PyTorch: {torch.__version__}")
-    print(f"[DETECTOR] CUDA Available: {CUDA_AVAILABLE}")
-    if CUDA_AVAILABLE:
-        print(f"[DETECTOR] GPU: {torch.cuda.get_device_name(0)}")
-except ImportError:
-    print("[DETECTOR] PyTorch: NOT AVAILABLE")
 
 # Import Pyzbar (primary decoder - fast)
 PYZBAR_AVAILABLE = False
@@ -64,85 +36,77 @@ try:
     pyzbar_decode = _pyzbar_decode
     ZBarSymbol = _ZBarSymbol
     PYZBAR_AVAILABLE = True
-    print("[DETECTOR] Pyzbar: LOADED (Primary - Fast)")
+    print("[DETECTOR] Pyzbar: LOADED")
 except ImportError as e:
     print(f"[DETECTOR] Pyzbar: NOT AVAILABLE ({e})")
 
-# Import QReader (fallback decoder - more robust but slower)
+# Import YOLO
+YOLO_AVAILABLE = False
+YOLO = None
+try:
+    from ultralytics import YOLO as _YOLO
+    YOLO = _YOLO
+    YOLO_AVAILABLE = True
+    print("[DETECTOR] YOLO: LOADED")
+except Exception as e:
+    print(f"[DETECTOR] YOLO: NOT AVAILABLE ({e})")
+    print(f"[DETECTOR] Warning: Running without YOLO (Deep Learning) support.")
+
+# QReader (lazy loaded - only when needed for deep scan)
 QREADER_AVAILABLE = False
 QReaderClass = None
 try:
     from qreader import QReader as _QReaderClass
     QReaderClass = _QReaderClass
     QREADER_AVAILABLE = True
-    print("[DETECTOR] QReader: LOADED (Fallback - Slow)")
-except Exception as e:
+    print("[DETECTOR] QReader: AVAILABLE (lazy-loaded on capture)")
+except ImportError as e:
     print(f"[DETECTOR] QReader: NOT AVAILABLE ({e})")
 
 # Import config
 try:
-    from config import QR_CONF_THRESHOLD, GPU_CONFIG
+    from config import QR_MODEL_PATH
 except ImportError:
-    QR_CONF_THRESHOLD = 0.5
-    GPU_CONFIG = {'force_cpu': False}
-
-# Apply Force CPU override
-if TORCH_AVAILABLE and CUDA_AVAILABLE and GPU_CONFIG.get('force_cpu', False):
-    print("[DETECTOR] GPU detected but FORCE_CPU is enabled. Switching to CPU.")
-    CUDA_AVAILABLE = False
-    if torch.cuda.is_available():
-         torch.cuda.is_available = lambda : False # Monkey patch to be sure? No, just rely on CUDA_AVAILABLE flag in class
-
-
-# Determine detection mode
-if PYZBAR_AVAILABLE and QREADER_AVAILABLE:
-    DETECTION_MODE = "Pyzbar + QReader"
-elif PYZBAR_AVAILABLE:
-    DETECTION_MODE = "Pyzbar Only"
-elif QREADER_AVAILABLE:
-    DETECTION_MODE = "QReader Only"
-else:
-    DETECTION_MODE = "OpenCV Fallback"
+    from pathlib import Path
+    QR_MODEL_PATH = Path(__file__).parent.parent / "models" / "model_qr" / "best.pt"
 
 print("="*60)
-print(f"DETECTOR STATUS (OPTIMIZED):")
+print(f"DETECTOR STATUS:")
 print(f"   Pyzbar: {'OK' if PYZBAR_AVAILABLE else 'FAILED'}")
-print(f"   QReader: {'OK' if QREADER_AVAILABLE else 'FAILED'}")
-print(f"   Mode: {DETECTION_MODE}")
-print(f"   GPU: {'ENABLED' if CUDA_AVAILABLE else 'CPU'}")
+print(f"   YOLO: {'OK' if YOLO_AVAILABLE else 'FAILED'}")
+print(f"   QReader: {'OK (lazy)' if QREADER_AVAILABLE else 'NOT AVAILABLE'}")
+print(f"   Model Path: {QR_MODEL_PATH}")
 print("="*60 + "\n")
 
 
 class QRDetector:
     """
-    Optimized QR Detector with fallback chain: Pyzbar -> QReader -> OpenCV
+    Fast QR Detector using YOLO for localization + Pyzbar for decoding.
     
-    Performance optimizations:
-    - Early exit on first successful detection
-    - Skip enhanced image if gray works
-    - Optional QReader (disabled for live preview)
-    - Single-scale first, multi-scale only if needed
+    Pipeline:
+    1. YOLO detects QR code bounding boxes (works at distance)
+    2. Crop detected regions with padding
+    3. Enhanced decode: Pyzbar -> Upscale+Pyzbar -> CLAHE+Pyzbar -> Sharpen+Pyzbar
     """
     
     def __init__(self):
         self.pyzbar_available = PYZBAR_AVAILABLE
-        self.qreader_available = QREADER_AVAILABLE
+        self.yolo_available = YOLO_AVAILABLE
         
-        # Initialize GPU Processor
-        from modules.gpu_utils import get_gpu_processor
-        self.gpu_processor = get_gpu_processor()
-        self.gpu_enabled = self.gpu_processor.gpu_available
+        # Initialize YOLO model for QR detection
+        self.model = None
+        if self.yolo_available:
+            try:
+                model_path = str(QR_MODEL_PATH)
+                logger.info(f"Loading YOLO model from: {model_path}")
+                self.model = YOLO(model_path)
+                logger.info("YOLO model loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load YOLO model: {e}")
+                self.model = None
         
-        # Initialize QReader instance if available (lazy - only on first use)
-        self.qreader = None
-        self._qreader_initialized = False
-        
-        # OpenCV QR detector as last resort
+        # OpenCV QR detector as last resort fallback
         self.cv_detector = cv2.QRCodeDetector()
-        
-        # Detection settings - MULTI-SCALE (Preserved for Distance)
-        self.scale_factors = [1.0, 0.75, 0.5]
-        self.use_multiscale = True  # ENABLED for distance
         
         # Threading for async detection
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="QRDetect")
@@ -150,23 +114,31 @@ class QRDetector:
         self._last_results = []
         self._detection_running = False
         
+        # QReader (lazy initialized - only on first capture)
+        self.qreader = None
+        self._qreader_initialized = False
+        self.qreader_available = QREADER_AVAILABLE
+        
         # Performance stats
         self._frame_count = 0
         self._total_time = 0
         
-        mode = "GPU ACCELERATED" if self.gpu_enabled else "CPU"
-        logger.info(f"QRDetector initialized in {mode} mode")
-        logger.info(f"Pyzbar: {'Yes' if self.pyzbar_available else 'No'}")
-        logger.info(f"Multi-scale: Enabled (1.0, 0.75, 0.5) - using {mode} resizing")
-
+        # Configuration
+        self.crop_padding = 15  # Pixels to add around detected QR
+        self.min_crop_size = 100  # Minimum crop size for upscaling
+        self.upscale_factor = 2  # How much to upscale small crops
+        self.confidence_threshold = 0.5  # YOLO confidence threshold
+        
+        logger.info(f"QRDetector initialized - YOLO: {self.model is not None}, Pyzbar: {self.pyzbar_available}, QReader: {self.qreader_available}")
+    
     def _init_qreader(self):
-        """Lazy initialize QReader only when needed"""
+        """Lazy initialize QReader only when needed (first capture)"""
         if self._qreader_initialized:
-            return
+            return self.qreader
         
         if self.qreader_available and QReaderClass is not None:
             try:
-                logger.info("Initializing QReader model (one-time)...")
+                logger.info("Initializing QReader model (one-time, may take a moment)...")
                 start = time.perf_counter()
                 self.qreader = QReaderClass(model_size='s', min_confidence=0.5)
                 elapsed = (time.perf_counter() - start) * 1000
@@ -174,65 +146,16 @@ class QRDetector:
             except Exception as e:
                 logger.error(f"QReader init failed: {e}")
                 self.qreader_available = False
+                self.qreader = None
+        
         self._qreader_initialized = True
-
-    @log_time
-    def _preprocess_frame_gpu(self, frame, scale=1.0):
-        """
-        Preprocess frame on GPU:
-        1. Upload to GPU (if needed)
-        2. Resize (if scale != 1.0)
-        3. Convert to Gray
-        4. Download Gray for pyzbar
-        """
-        # 1. Upload
-        gpu_frame = self.gpu_processor.upload_to_gpu(frame)
-        
-        # 2. Resize on GPU
-        if scale != 1.0:
-            h, w = frame.shape[:2]
-            new_w, new_h = int(w * scale), int(h * scale)
-            gpu_frame = self.gpu_processor.resize_gpu(gpu_frame, (new_w, new_h))
-            
-        # 3. Convert to Gray on GPU
-        gpu_gray = self.gpu_processor.cvt_color_gpu(gpu_frame, cv2.COLOR_BGR2GRAY)
-        
-        # 4. Download (Pyzbar needs CPU numpy array)
-        gray = self.gpu_processor.download_from_gpu(gpu_gray)
-        
-        return gray
-
-    def _decode_pyzbar(self, image):
-        """Decode QR codes using Pyzbar (fast)."""
-        if not self.pyzbar_available or pyzbar_decode is None:
-            return []
-        
-        results = []
-        try:
-            # start = time.perf_counter()
-            decoded = pyzbar_decode(image, symbols=[ZBarSymbol.QRCODE])
-            # elapsed = (time.perf_counter() - start) * 1000
-            
-            for obj in decoded:
-                text = obj.data.decode("utf-8")
-                if text:
-                    rect = obj.rect
-                    bbox = (rect.left, rect.top, rect.left + rect.width, rect.top + rect.height)
-                    results.append({'data': text, 'bbox': bbox, 'source': 'pyzbar'})
-            
-            # if results:
-            #     logger.debug(f"Pyzbar found {len(results)} QR codes in {elapsed:.1f}ms")
-        except Exception as e:
-            logger.warning(f"Pyzbar error: {e}")
-        
-        return results
-
+        return self.qreader
+    
     def _decode_qreader(self, image):
-        """Decode QR codes using QReader (robust, uses ML) - SLOW."""
+        """Decode QR codes using QReader (ML-based, slower but more robust)."""
         if self.qreader is None:
             return []
         
-        # print("[DETECTOR] Running QReader model scan...")
         results = []
         try:
             start = time.perf_counter()
@@ -240,8 +163,7 @@ class QRDetector:
             elapsed = (time.perf_counter() - start) * 1000
             
             if texts:
-                # print(f"[DETECTOR] QReader Raw Output: {texts}")
-                for i, text in enumerate(texts):
+                for text in texts:
                     if text:
                         h, w = image.shape[:2]
                         results.append({
@@ -251,20 +173,98 @@ class QRDetector:
                         })
             
             if len(results) > 0:
-                logger.debug(f"QReader found {len(results)} QR codes in {elapsed:.1f}ms")
-            
+                logger.info(f"QReader found {len(results)} QR codes in {elapsed:.1f}ms")
+                
         except Exception as e:
             logger.warning(f"QReader error: {e}")
         
         return results
 
+    def _decode_pyzbar(self, image):
+        """Decode QR codes using Pyzbar (fast)."""
+        if not self.pyzbar_available or pyzbar_decode is None:
+            return []
+        
+        results = []
+        try:
+            # Ensure grayscale for Pyzbar
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            decoded = pyzbar_decode(gray, symbols=[ZBarSymbol.QRCODE])
+            
+            for obj in decoded:
+                text = obj.data.decode("utf-8")
+                if text:
+                    rect = obj.rect
+                    bbox = (rect.left, rect.top, rect.left + rect.width, rect.top + rect.height)
+                    results.append({'data': text, 'bbox': bbox, 'source': 'pyzbar'})
+        except Exception as e:
+            logger.warning(f"Pyzbar error: {e}")
+        
+        return results
+    
+    def _enhanced_decode(self, crop):
+        """
+        Enhanced decode with multiple preprocessing attempts.
+        Tries: Raw -> Upscale -> CLAHE -> Sharpen
+        """
+        # 1. Try original crop first (fastest)
+        results = self._decode_pyzbar(crop)
+        if results:
+            return results
+        
+        # Convert to grayscale for preprocessing
+        if len(crop.shape) == 3:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = crop.copy()
+        
+        h, w = gray.shape[:2]
+        
+        # 2. Upscale if crop is small (for distance detection)
+        if w < self.min_crop_size or h < self.min_crop_size:
+            upscaled = cv2.resize(gray, (w * self.upscale_factor, h * self.upscale_factor), 
+                                   interpolation=cv2.INTER_CUBIC)
+            results = self._decode_pyzbar(upscaled)
+            if results:
+                return results
+            gray = upscaled  # Use upscaled for further processing
+        
+        # 3. CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        results = self._decode_pyzbar(enhanced)
+        if results:
+            return results
+        
+        # 4. Sharpening kernel
+        kernel = np.array([[-1, -1, -1], 
+                          [-1,  9, -1], 
+                          [-1, -1, -1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel)
+        results = self._decode_pyzbar(sharpened)
+        if results:
+            return results
+        
+        # 5. Binary threshold as last resort
+        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        results = self._decode_pyzbar(binary)
+        
+        return results
+    
     def _decode_opencv(self, image):
         """Fallback: Decode using OpenCV's QRCodeDetector."""
         results = []
         try:
-            # start = time.perf_counter()
-            data, points, _ = self.cv_detector.detectAndDecode(image)
-            # elapsed = (time.perf_counter() - start) * 1000
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+                
+            data, points, _ = self.cv_detector.detectAndDecode(gray)
             
             if data and points is not None:
                 pts = points[0]
@@ -285,11 +285,11 @@ class QRDetector:
     def detect_and_decode(self, frame, use_qreader=False):
         """
         Detect and decode QR codes in the frame.
-        Use GPU for valid resizing and color conversion.
+        Uses YOLO for localization, then Pyzbar for decoding crops.
         
         Args:
             frame: Input BGR frame
-            use_qreader: Enable QReader fallback (slow, use only for final capture)
+            use_qreader: Enable QReader deep scan (slower, use only for capture)
         
         Returns: (list of decoded objects, total count)
         """
@@ -298,55 +298,86 @@ class QRDetector:
         
         start_total = time.perf_counter()
         
+        # Initialize QReader if needed for capture mode (lazy load)
+        if use_qreader and self.qreader_available and not self._qreader_initialized:
+            logger.info("[CAPTURE MODE] Initializing QReader for deep scan...")
+            self._init_qreader()
+        
         all_results = []
         seen_texts = set()
         
-        # Upload frame ONCE if using GPU, to avoid repeated uploads (Future opt)
-        # For now, simplest path is to let _preprocess_frame_gpu handle it per scale
+        # Get frame dimensions
+        h, w = frame.shape[:2]
         
-        # Multi-scale detection loop
-        scales = self.scale_factors if self.use_multiscale else [1.0]
+        # === YOLO-based detection ===
+        if self.model is not None:
+            try:
+                # Run YOLO inference
+                yolo_results = self.model(frame, verbose=False, conf=self.confidence_threshold)
+                
+                for result in yolo_results:
+                    for box in result.boxes:
+                        # Get bounding box coordinates
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        
+                        # Add padding for better decoding
+                        pad = self.crop_padding
+                        crop_x1 = max(0, x1 - pad)
+                        crop_y1 = max(0, y1 - pad)
+                        crop_x2 = min(w, x2 + pad)
+                        crop_y2 = min(h, y2 + pad)
+                        
+                        # Crop the region
+                        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                        
+                        if crop.size > 0:
+                            # Try enhanced decode on the crop
+                            decoded = self._enhanced_decode(crop)
+                            
+                            # If capture mode and Pyzbar failed, try QReader on crop
+                            if not decoded and use_qreader and self.qreader is not None:
+                                logger.info(f"[CAPTURE] Pyzbar failed, trying QReader on crop...")
+                                decoded = self._decode_qreader(crop)
+                            
+                            for result_item in decoded:
+                                text = result_item['data']
+                                if text and text not in seen_texts:
+                                    seen_texts.add(text)
+                                    # Map bbox back to original frame coordinates
+                                    all_results.append({
+                                        'data': text,
+                                        'bbox': (x1, y1, x2, y2),
+                                        'source': result_item.get('source', '')
+                                    })
+                                    
+            except Exception as e:
+                logger.error(f"YOLO detection error: {e}")
         
-        for scale in scales:
-            # === GPU ACCELERATED PREPROCESSING ===
-            # Resizes and converts to Gray on GPU, then downloads small gray image
-            gray = self._preprocess_frame_gpu(frame, scale)
-            
-            # --- 1. Pyzbar (Fast CPU) ---
-            results = self._decode_pyzbar(gray)
-            
-            # --- 2. QReader (Slow, Optional) ---
-            if not results and use_qreader and self.qreader_available:
-                self._init_qreader()
-                if self.qreader:
-                     results.extend(self._decode_qreader(gray))
-            
-            # --- 3. OpenCV (Fallback) ---
-            if not results and len(scales) == 1: # Only try opencv if strictly single scale
-                 results.extend(self._decode_opencv(gray))
-
-            # Process results for this scale
-            scale_results = []
-            for result in results:
+        # === Fallback: Direct Pyzbar on full frame (if YOLO not available or found nothing) ===
+        if not all_results:
+            # Try direct Pyzbar decode (fast, works for large visible QRs)
+            direct_results = self._decode_pyzbar(frame)
+            for result in direct_results:
                 if result['data'] not in seen_texts:
                     seen_texts.add(result['data'])
-                    
-                    # Rescale bbox back to original size
-                    if scale != 1.0:
-                        x1, y1, x2, y2 = result['bbox']
-                        result['bbox'] = (
-                            int(x1 / scale), int(y1 / scale),
-                            int(x2 / scale), int(y2 / scale)
-                        )
-                    scale_results.append(result)
-            
-            all_results.extend(scale_results)
-            
-            # Early exit: If we found results, don't keep searching other scales
-            # (Unless we want to find ALL, but typically we want ANY valid QR quickly)
-            # For distance, if we found it at 1.0, great. If not, try 0.75, etc.
-            if all_results:
-                break
+                    all_results.append(result)
+        
+        # === Fallback: OpenCV QR detector ===
+        if not all_results:
+            opencv_results = self._decode_opencv(frame)
+            for result in opencv_results:
+                if result['data'] not in seen_texts:
+                    seen_texts.add(result['data'])
+                    all_results.append(result)
+        
+        # === Final Fallback: QReader on full frame (only in capture mode) ===
+        if not all_results and use_qreader and self.qreader is not None:
+            logger.info("[CAPTURE] All methods failed, trying QReader on full frame...")
+            qreader_results = self._decode_qreader(frame)
+            for result in qreader_results:
+                if result['data'] not in seen_texts:
+                    seen_texts.add(result['data'])
+                    all_results.append(result)
         
         elapsed_total = (time.perf_counter() - start_total) * 1000
         
@@ -357,7 +388,9 @@ class QRDetector:
         if self._frame_count % 30 == 0:  # Log every 30 frames
             avg_time = self._total_time / self._frame_count
             logger.info(f"Avg detection time: {avg_time:.1f}ms ({1000/avg_time:.1f} FPS potential)")
-            # self.gpu_processor.logger.info(f"GPU Active: {self.gpu_enabled}")
+        
+        if use_qreader:
+            logger.info(f"[CAPTURE] Detection complete: {len(all_results)} QRs in {elapsed_total:.0f}ms")
         
         return all_results, len(all_results)
 
@@ -402,7 +435,7 @@ class QRDetector:
         self._executor.shutdown(wait=False)
 
 
-# Convenience functions
+# Convenience functions (kept for compatibility)
 def detect_qr_standard(frame, use_qreader=False):
     """Detect QR codes in full frame."""
     detector = QRDetector()
@@ -412,14 +445,12 @@ def detect_qr_standard(frame, use_qreader=False):
 def detect_qr_advanced(image_path):
     """
     Advanced QR detection from file path.
-    Uses QReader for thorough detection.
     """
     print(f"\n[ADVANCED] --------------------------------------------------")
     print(f"[ADVANCED] Starting Advanced Detection on: {image_path}")
     print(f"[ADVANCED] --------------------------------------------------")
     
     try:
-        import cv2
         frame = cv2.imread(str(image_path))
         if frame is None:
             print(f"[ADVANCED] ERROR: Could not read image file")
@@ -428,14 +459,13 @@ def detect_qr_advanced(image_path):
         print(f"[ADVANCED] Image loaded successfully: {frame.shape}")
         
         detector = QRDetector()
-        print(f"[ADVANCED] calling detector.detect_and_decode(use_qreader=True)...")
-        results, count = detector.detect_and_decode(frame, use_qreader=True)  # Enable QReader for saved images
+        results, count = detector.detect_and_decode(frame)
         
         print(f"[ADVANCED] Detection finished. Total QRs found: {count}")
         if count > 0:
             print(f"[ADVANCED] Detected QR Data: {[r['data'] for r in results]}")
         else:
-            print(f"[ADVANCED] No QR codes found in advanced mode.")
+            print(f"[ADVANCED] No QR codes found.")
             
         print(f"[ADVANCED] --------------------------------------------------\n")
         return results, count
@@ -453,8 +483,8 @@ def detect_composition(frame):
 def get_gpu_status():
     """Return current GPU status."""
     return {
-        'gpu_enabled': CUDA_AVAILABLE,
-        'detection_mode': DETECTION_MODE,
+        'gpu_enabled': False,  # GPU preprocessing removed for speed
+        'detection_mode': 'YOLO + Pyzbar',
         'pyzbar': PYZBAR_AVAILABLE,
-        'qreader': QREADER_AVAILABLE
+        'yolo': YOLO_AVAILABLE
     }

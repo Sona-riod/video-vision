@@ -257,12 +257,15 @@ class CameraManager:
                 return True
                 
             def release(self): 
+                """Dummy method: no resource to release for test camera"""
                 pass
                 
             def set(self, prop, val): 
+                """Dummy method: property setting not supported in test mode"""
                 pass
                 
             def get(self, prop): 
+                """Dummy method: property getting not supported in test mode"""
                 return 0
                 
         return TestCap()

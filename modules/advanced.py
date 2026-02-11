@@ -43,6 +43,19 @@ class AdvancedQRDetector:
         logger.info(f"Advanced: Tile size: {self.slice_width}x{self.slice_height}")
         logger.info(f"Advanced: Overlap: {overlap_w}x{overlap_h} (steps: {step_x}x{step_y})")
 
+        tile_positions = self._generate_tile_positions(img_w, img_h, step_x, step_y)
+        
+        logger.info(f"Advanced: Total tiles to generate: {len(tile_positions)}")
+        
+        tile_count = 0
+        for x, y in tile_positions:
+            if self._save_tile(image, x, y, img_w, img_h, output_dir, tile_count):
+                tile_count += 1
+
+        logger.info(f"Advanced: Saved {tile_count} tiles to: {os.path.abspath(output_dir)}")
+        return tile_count
+
+    def _generate_tile_positions(self, img_w, img_h, step_x, step_y):
         tile_positions = []
         
         y = 0
@@ -72,35 +85,29 @@ class AdvancedQRDetector:
             corner_pos = (max(0, img_w - self.slice_width), max(0, img_h - self.slice_height))
             tile_positions.append(corner_pos)
         
-        tile_positions = sorted(list(set(tile_positions)))
+        return sorted(list(set(tile_positions)))
+
+    def _save_tile(self, image, x, y, img_w, img_h, output_dir, tile_count):
+        x_end = min(x + self.slice_width, img_w)
+        y_end = min(y + self.slice_height, img_h)
         
-        logger.info(f"Advanced: Total tiles to generate: {len(tile_positions)}")
+        actual_width = x_end - x
+        actual_height = y_end - y
         
-        tile_count = 0
-        for x, y in tile_positions:
-            x_end = min(x + self.slice_width, img_w)
-            y_end = min(y + self.slice_height, img_h)
-            
-            actual_width = x_end - x
-            actual_height = y_end - y
-            
-            if actual_width < self.slice_width * 0.25 or actual_height < self.slice_height * 0.25:
-                continue
-            
-            box = (x, y, x_end, y_end)
-            tile = image.crop(box)
+        if actual_width < self.slice_width * 0.25 or actual_height < self.slice_height * 0.25:
+            return False
+        
+        box = (x, y, x_end, y_end)
+        tile = image.crop(box)
 
-            if tile.size != (self.slice_width, self.slice_height):
-                padded = Image.new("RGB", (self.slice_width, self.slice_height), (0, 0, 0))  # Black padding as in your initial
-                padded.paste(tile, (0, 0))
-                tile = padded
+        if tile.size != (self.slice_width, self.slice_height):
+            padded = Image.new("RGB", (self.slice_width, self.slice_height), (0, 0, 0))  # Black padding as in your initial
+            padded.paste(tile, (0, 0))
+            tile = padded
 
-            filename = f"tile_{tile_count:03d}_x{x}_y{y}.png"
-            tile.save(os.path.join(output_dir, filename))
-            tile_count += 1
-
-        logger.info(f"Advanced: Saved {tile_count} tiles to: {os.path.abspath(output_dir)}")
-        return tile_count
+        filename = f"tile_{tile_count:03d}_x{x}_y{y}.png"
+        tile.save(os.path.join(output_dir, filename))
+        return True
 
     def unblur_image(self, image):
         """Unblur - Matches your initial logic exactly."""
@@ -247,44 +254,11 @@ class AdvancedQRDetector:
                 return list(unique_qr_codes)
             
             # Step 2: Process each tile
-            logger.info(f"Advanced: Step 2 - Processing {tile_count} tiles...")
-            all_cropped_paths = []
-            total_detections = 0
-            
-            for tile_file in sorted(os.listdir(tiles_dir)):
-                if tile_file.lower().endswith(".png"):
-                    tile_path = os.path.join(tiles_dir, tile_file)
-                    cropped_paths, detections = self.detect_and_crop_qr_yolo(tile_path, cropped_dir)
-                    total_detections += detections
-                    all_cropped_paths.extend(cropped_paths)
-            
+            all_cropped_paths, total_detections = self._process_tiles(tiles_dir, cropped_dir)
             logger.info(f"Advanced: Total detections across tiles: {total_detections}")
             
             # Step 3: Decode all cropped QR images
-            logger.info("Advanced: Step 3 - Decoding QR codes...")
-            decoded_count = 0
-            
-            for cropped_img in all_cropped_paths:
-                # Try QReader first
-                qr_results = self.decode_qr_qreader(cropped_img)
-                for qr in qr_results:
-                    if qr not in unique_qr_codes:
-                        unique_qr_codes.add(qr)
-                        decoded_count += 1
-                        logger.info(f"Advanced: QReader decoded: {qr[:50]}{'...' if len(qr) > 50 else ''}")
-                
-                # Try pyzbar as backup
-                image = cv2.imread(cropped_img)
-                if image is not None:
-                    decoded_objects, success = self.decode_qr_pyzbar(image)
-                    if success:
-                        for obj in decoded_objects:
-                            qr_data = obj.data.decode('utf-8').strip()
-                            if qr_data and qr_data not in unique_qr_codes:
-                                unique_qr_codes.add(qr_data)
-                                decoded_count += 1
-                                logger.info(f"Advanced: pyzbar decoded: {qr_data[:50]}{'...' if len(qr_data) > 50 else ''}")
-            
+            self._decode_cropped_images(all_cropped_paths, unique_qr_codes)
             logger.info(f"Advanced: Decoding completed. Unique QR codes found: {len(unique_qr_codes)}")
             
         except Exception as e:
@@ -297,6 +271,48 @@ class AdvancedQRDetector:
                 logger.info("Advanced: Temporary files cleaned up")
         
         return list(unique_qr_codes)
+
+    def _process_tiles(self, tiles_dir, cropped_dir):
+        logger.info(f"Advanced: Step 2 - Processing tiles...")
+        all_cropped_paths = []
+        total_detections = 0
+        
+        tile_files = sorted([f for f in os.listdir(tiles_dir) if f.lower().endswith(".png")])
+        logger.info(f"Advanced: Processing {len(tile_files)} tiles...")
+
+        for tile_file in tile_files:
+            tile_path = os.path.join(tiles_dir, tile_file)
+            cropped_paths, detections = self.detect_and_crop_qr_yolo(tile_path, cropped_dir)
+            total_detections += detections
+            all_cropped_paths.extend(cropped_paths)
+        
+        return all_cropped_paths, total_detections
+
+    def _decode_cropped_images(self, all_cropped_paths, unique_qr_codes):
+        logger.info("Advanced: Step 3 - Decoding QR codes...")
+        decoded_count = 0
+        
+        for cropped_img in all_cropped_paths:
+            # Try QReader first
+            qr_results = self.decode_qr_qreader(cropped_img)
+            for qr in qr_results:
+                if qr not in unique_qr_codes:
+                    unique_qr_codes.add(qr)
+                    decoded_count += 1
+                    logger.info(f"Advanced: QReader decoded: {qr[:50]}{'...' if len(qr) > 50 else ''}")
+            
+            # Try pyzbar as backup
+            image = cv2.imread(cropped_img)
+            if image is not None:
+                decoded_objects, success = self.decode_qr_pyzbar(image)
+                if success:
+                    for obj in decoded_objects:
+                        qr_data = obj.data.decode('utf-8').strip()
+                        if qr_data and qr_data not in unique_qr_codes:
+                            unique_qr_codes.add(qr_data)
+                            decoded_count += 1
+                            logger.info(f"Advanced: pyzbar decoded: {qr_data[:50]}{'...' if len(qr_data) > 50 else ''}")
+        return unique_qr_codes
 
 # Standalone function for external use (as in your initial)
 def run_advanced_detection(image_path, model_path=None):

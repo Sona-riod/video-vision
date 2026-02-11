@@ -14,6 +14,7 @@ qreader>=3.10         # Uses PyTorch - GPU accelerated
 
 # UI & Utilities
 kivy>=2.2.0
+kivymd>=1.1.1
 requests>=2.31.0
 numpy>=1.24.0
 Pillow>=10.0.0

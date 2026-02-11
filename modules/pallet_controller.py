@@ -114,7 +114,7 @@ class PalletController:
             try:
                 if result[10]:  # qr_data field
                     qr_data = json.loads(result[10])
-            except:
+            except Exception:
                 pass
                 
             return {
