@@ -8,6 +8,9 @@ import time
 from datetime import datetime
 import re 
 from pathlib import Path  
+import re
+
+CONFIG_FILENAME = "config.py"
 
 def setup_logging(log_level=logging.INFO, log_file=None):
     """Setup logging configuration"""
@@ -104,7 +107,7 @@ def format_duration(seconds):
 # NEW FUNCTION: For persisting keg count to config.py
 def save_default_keg_count(value: int):
     """Safely update DEFAULT_KEG_COUNT in config.py"""
-    config_path = Path(__file__).parent.parent / "config.py"  # Assumes modules/ is subdir of root
+    config_path = Path(__file__).parent.parent / CONFIG_FILENAME  # Assumes modules/ is subdir of root
     if not config_path.exists():
         logging.warning("config.py not found!")
         return False
@@ -122,7 +125,7 @@ def save_default_keg_count(value: int):
 def save_last_batch(batch_number: str):
     """Save the last batch number to file"""
     try:
-        config_path = Path(__file__).parent.parent / "config.py"
+        config_path = Path(__file__).parent.parent / CONFIG_FILENAME
         config_dir = config_path.parent
         
         # Create batch memory file
@@ -139,7 +142,7 @@ def save_last_batch(batch_number: str):
 def load_last_batch() -> str:
     """Load the last batch number from file"""
     try:
-        config_path = Path(__file__).parent.parent / "config.py"
+        config_path = Path(__file__).parent.parent / CONFIG_FILENAME
         config_dir = config_path.parent
         batch_file = config_dir / "last_batch.txt"
         

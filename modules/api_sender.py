@@ -200,12 +200,7 @@ class APISender:
         """
         Send request with retry logic
         """
-        print("\n" + "="*60)
-        print("STEP 1: Starting API Send Process")
-        print("="*60)
-        print(f"  Batch ID: {batch_id}")
-        print(f"  API Endpoint: {self.api_url}")
-        print(f"  Start Attempt: {start_attempt}")
+        self._print_start_banner(batch_id, start_attempt)
         
         last_error = None
         
@@ -217,86 +212,124 @@ class APISender:
         self._log_request_details(payload, headers)
         
         for attempt in range(start_attempt + 1, start_attempt + self.max_retries + 1):
-            print(f"\n{'='*60}")
-            print(f"STEP 5: Sending request (Attempt {attempt}/{start_attempt + self.max_retries})")
-            print("="*60)
-            print(f"  URL: {self.api_url}")
-            print(f"  Method: POST")
-            print(f"  Timeout: {self.timeout} seconds")
-            print(f"  SSL Verify: False")
+            success, error_msg, should_break = self._process_single_attempt(batch_id, payload, headers, attempt, start_attempt)
             
-            try:
-                self.logger.info(f"Sending {batch_id} to cloud (attempt {attempt})")
+            if success:
+                return True
+            
+            if error_msg:
+                last_error = error_msg
                 
-                import time as _time
-                start_time = _time.time()
-                
-                # Try the primary endpoint first
-                response = self.session.post(
-                    self.api_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=self.timeout,
-                    verify=False
-                )
-                
-                elapsed = _time.time() - start_time
-                
-                print(f"\nSTEP 6: Response received in {elapsed:.4f} seconds")
-                print(f"  Status Code: {response.status_code}")
-                print(f"  Reason: {response.reason}")
-                print(f"  Response Headers: {dict(response.headers)}")
-                print(f"\nSTEP 7: Response Body:")
-                print("-"*40)
-                print(response.text)
-                print("-"*40)
-                
-                # Check response
-                if response.status_code in [200, 201]:
-                    return self._handle_success_response(response, batch_id)
-                else:
-                    last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-                    print(f"\nSTEP 8: FAILURE - Status {response.status_code}")
-                    print(f"  Error: {last_error}")
-                    self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
-                    
-            except requests.exceptions.SSLError as e:
-                # SSL error handling
-                if self._attempt_http_fallback(e, batch_id, payload, headers):
-                     return True
-                last_error = f"SSL verification failed: {str(e)}"
-                self.logger.error(f"Batch {batch_id}: {last_error} (attempt {attempt})")
-                
-            except requests.exceptions.Timeout:
-                last_error = "Request timeout"
-                print(f"\nSTEP 6: TIMEOUT ERROR")
-                print(f"  Request timed out after {self.timeout} seconds")
-                self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
-            except requests.exceptions.RequestException as e:
-                last_error = f"Network error: {str(e)}"
-                print(f"\nSTEP 6: NETWORK ERROR")
-                print(f"  Error: {e}")
-                self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
-            except Exception as e:
-                last_error = f"Unexpected error: {str(e)}"
-                print(f"\nSTEP 6: UNEXPECTED ERROR")
-                print(f"  Error: {e}")
-                self.logger.error(f"Batch {batch_id}: {last_error}")
-                break  # Don't retry on unexpected errors
+            if should_break:
+                break
             
             # Wait before retry (exponential backoff)
             if attempt < start_attempt + self.max_retries:
-                wait_time = 2 ** (attempt - start_attempt - 1)  # 1, 2, 4 seconds
-                print(f"\nWaiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
+                self._wait_before_retry(attempt, start_attempt)
         
         # Update error in database
         self._log_error_to_db(batch_id, last_error)
         
+        self._print_failure_banner()
+        return False
+
+    def _process_single_attempt(self, batch_id, payload, headers, attempt, start_attempt):
+        self._print_attempt_banner(attempt, start_attempt)
+        
+        try:
+            self.logger.info(f"Sending {batch_id} to cloud (attempt {attempt})")
+            
+            import time as _time
+            start_time = _time.time()
+            
+            # Try the primary endpoint first
+            response = self.session.post(
+                self.api_url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+                verify=False
+            )
+            
+            elapsed = _time.time() - start_time
+            
+            self._print_response_details(response, elapsed)
+            
+            # Check response
+            if response.status_code in [200, 201]:
+                return self._handle_success_response(response, batch_id), None, False
+            else:
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                print(f"\nSTEP 8: FAILURE - Status {response.status_code}")
+                print(f"  Error: {last_error}")
+                self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
+                return False, last_error, False
+                
+        except requests.exceptions.SSLError as e:
+            # SSL error handling
+            if self._attempt_http_fallback(e, batch_id, payload, headers):
+                 return True, None, False
+            last_error = f"SSL verification failed: {str(e)}"
+            self.logger.error(f"Batch {batch_id}: {last_error} (attempt {attempt})")
+            return False, last_error, False
+            
+        except requests.exceptions.Timeout:
+            last_error = "Request timeout"
+            print(f"\nSTEP 6: TIMEOUT ERROR")
+            print(f"  Request timed out after {self.timeout} seconds")
+            self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
+            return False, last_error, False
+        
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {str(e)}"
+            print(f"\nSTEP 6: NETWORK ERROR")
+            print(f"  Error: {e}")
+            self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
+            return False, last_error, False
+        
+        except Exception as e:
+            last_error = f"Unexpected error: {str(e)}"
+            print(f"\nSTEP 6: UNEXPECTED ERROR")
+            print(f"  Error: {e}")
+            self.logger.error(f"Batch {batch_id}: {last_error}")
+            return False, last_error, True  # Break on unexpected errors
+
+    def _print_start_banner(self, batch_id, start_attempt):
+        print("\n" + "="*60)
+        print("STEP 1: Starting API Send Process")
+        print("="*60)
+        print(f"  Batch ID: {batch_id}")
+        print(f"  API Endpoint: {self.api_url}")
+        print(f"  Start Attempt: {start_attempt}")
+
+    def _print_attempt_banner(self, attempt, start_attempt):
+        print(f"\n{'='*60}")
+        print(f"STEP 5: Sending request (Attempt {attempt}/{start_attempt + self.max_retries})")
+        print("="*60)
+        print(f"  URL: {self.api_url}")
+        print(f"  Method: POST")
+        print(f"  Timeout: {self.timeout} seconds")
+        print(f"  SSL Verify: False")
+
+    def _print_response_details(self, response, elapsed):
+        print(f"\nSTEP 6: Response received in {elapsed:.4f} seconds")
+        print(f"  Status Code: {response.status_code}")
+        print(f"  Reason: {response.reason}")
+        print(f"  Response Headers: {dict(response.headers)}")
+        print(f"\nSTEP 7: Response Body:")
+        print("-"*40)
+        print(response.text)
+        print("-"*40)
+
+    def _wait_before_retry(self, attempt, start_attempt):
+        wait_time = 2 ** (attempt - start_attempt - 1)  # 1, 2, 4 seconds
+        print(f"\nWaiting {wait_time} seconds before retry...")
+        time.sleep(wait_time)
+
+    def _print_failure_banner(self):
         print("\n" + "="*60)
         print("API SEND FAILED")
         print("="*60 + "\n")
-        return False
 
     def _add_payload_hash(self, payload, batch_id):
         # Add payload hash for integrity if enabled

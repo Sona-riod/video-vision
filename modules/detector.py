@@ -295,93 +295,106 @@ class QRDetector:
         """
         if frame is None:
             return [], 0
-        
+            
         start_total = time.perf_counter()
         
-        # Initialize QReader if needed for capture mode (lazy load)
-        if use_qreader and self.qreader_available and not self._qreader_initialized:
-            logger.info("[CAPTURE MODE] Initializing QReader for deep scan...")
-            self._init_qreader()
+        # Initialize QReader if needed for capture mode
+        self._init_qreader_if_needed(use_qreader)
         
         all_results = []
         seen_texts = set()
         
-        # Get frame dimensions
-        h, w = frame.shape[:2]
-        
-        # === YOLO-based detection ===
+        # 1. YOLO-based detection
         if self.model is not None:
-            try:
-                # Run YOLO inference
-                yolo_results = self.model(frame, verbose=False, conf=self.confidence_threshold)
-                
-                for result in yolo_results:
-                    for box in result.boxes:
-                        # Get bounding box coordinates
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        
-                        # Add padding for better decoding
-                        pad = self.crop_padding
-                        crop_x1 = max(0, x1 - pad)
-                        crop_y1 = max(0, y1 - pad)
-                        crop_x2 = min(w, x2 + pad)
-                        crop_y2 = min(h, y2 + pad)
-                        
-                        # Crop the region
-                        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                        
-                        if crop.size > 0:
-                            # Try enhanced decode on the crop
-                            decoded = self._enhanced_decode(crop)
-                            
-                            # If capture mode and Pyzbar failed, try QReader on crop
-                            if not decoded and use_qreader and self.qreader is not None:
-                                logger.info(f"[CAPTURE] Pyzbar failed, trying QReader on crop...")
-                                decoded = self._decode_qreader(crop)
-                            
-                            for result_item in decoded:
-                                text = result_item['data']
-                                if text and text not in seen_texts:
-                                    seen_texts.add(text)
-                                    # Map bbox back to original frame coordinates
-                                    all_results.append({
-                                        'data': text,
-                                        'bbox': (x1, y1, x2, y2),
-                                        'source': result_item.get('source', '')
-                                    })
-                                    
-            except Exception as e:
-                logger.error(f"YOLO detection error: {e}")
+             self._run_yolo_detection(frame, use_qreader, all_results, seen_texts)
         
-        # === Fallback: Direct Pyzbar on full frame (if YOLO not available or found nothing) ===
+        # 2. Fallbacks (Pyzbar -> OpenCV -> QReader)
         if not all_results:
-            # Try direct Pyzbar decode (fast, works for large visible QRs)
-            direct_results = self._decode_pyzbar(frame)
-            for result in direct_results:
-                if result['data'] not in seen_texts:
-                    seen_texts.add(result['data'])
-                    all_results.append(result)
-        
-        # === Fallback: OpenCV QR detector ===
-        if not all_results:
-            opencv_results = self._decode_opencv(frame)
-            for result in opencv_results:
-                if result['data'] not in seen_texts:
-                    seen_texts.add(result['data'])
-                    all_results.append(result)
-        
-        # === Final Fallback: QReader on full frame (only in capture mode) ===
-        if not all_results and use_qreader and self.qreader is not None:
-            logger.info("[CAPTURE] All methods failed, trying QReader on full frame...")
-            qreader_results = self._decode_qreader(frame)
-            for result in qreader_results:
-                if result['data'] not in seen_texts:
-                    seen_texts.add(result['data'])
-                    all_results.append(result)
+             self._run_fallbacks(frame, use_qreader, all_results, seen_texts)
         
         elapsed_total = (time.perf_counter() - start_total) * 1000
         
         # Update stats
+        self._update_stats(elapsed_total, len(all_results), use_qreader)
+        
+        return all_results, len(all_results)
+
+    def _init_qreader_if_needed(self, use_qreader):
+        if use_qreader and self.qreader_available and not self._qreader_initialized:
+            logger.info("[CAPTURE MODE] Initializing QReader for deep scan...")
+            self._init_qreader()
+
+    def _run_yolo_detection(self, frame, use_qreader, all_results, seen_texts):
+        try:
+            # Run YOLO inference
+            yolo_results = self.model(frame, verbose=False, conf=self.confidence_threshold)
+            
+            h, w = frame.shape[:2]
+            
+            for result in yolo_results:
+                for box in result.boxes:
+                    self._process_yolo_box(box, frame, h, w, use_qreader, all_results, seen_texts)
+        except Exception as e:
+            logger.error(f"YOLO detection error: {e}")
+
+    def _process_yolo_box(self, box, frame, h, w, use_qreader, all_results, seen_texts):
+        # Get bounding box coordinates
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        
+        # Add padding for better decoding
+        pad = self.crop_padding
+        crop_x1 = max(0, x1 - pad)
+        crop_y1 = max(0, y1 - pad)
+        crop_x2 = min(w, x2 + pad)
+        crop_y2 = min(h, y2 + pad)
+        
+        # Crop the region
+        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        
+        if crop.size > 0:
+            self._decode_crop(crop, use_qreader, (x1, y1, x2, y2), all_results, seen_texts)
+
+    def _decode_crop(self, crop, use_qreader, bbox, all_results, seen_texts):
+        # Try enhanced decode on the crop
+        decoded = self._enhanced_decode(crop)
+        
+        # If capture mode and Pyzbar failed, try QReader on crop
+        if not decoded and use_qreader and self.qreader is not None:
+             logger.info(f"[CAPTURE] Pyzbar failed, trying QReader on crop...")
+             decoded = self._decode_qreader(crop)
+        
+        for result_item in decoded:
+            text = result_item['data']
+            if text and text not in seen_texts:
+                seen_texts.add(text)
+                # Map bbox back to original frame coordinates but keep source info
+                all_results.append({
+                    'data': text,
+                    'bbox': bbox,
+                    'source': result_item.get('source', '')
+                })
+
+    def _run_fallbacks(self, frame, use_qreader, all_results, seen_texts):
+        # Try direct Pyzbar decode (fast, works for large visible QRs)
+        if not all_results:
+            self._collect_results(self._decode_pyzbar(frame), all_results, seen_texts)
+            
+        # Try OpenCV QR detector
+        if not all_results:
+            self._collect_results(self._decode_opencv(frame), all_results, seen_texts)
+            
+        # Final Fallback: QReader on full frame (only in capture mode)
+        if not all_results and use_qreader and self.qreader is not None:
+            logger.info("[CAPTURE] All methods failed, trying QReader on full frame...")
+            self._collect_results(self._decode_qreader(frame), all_results, seen_texts)
+
+    def _collect_results(self, source_results, all_results, seen_texts):
+        for result in source_results:
+            if result['data'] not in seen_texts:
+                seen_texts.add(result['data'])
+                all_results.append(result)
+
+    def _update_stats(self, elapsed_total, count, use_qreader):
         self._frame_count += 1
         self._total_time += elapsed_total
         
@@ -390,9 +403,7 @@ class QRDetector:
             logger.info(f"Avg detection time: {avg_time:.1f}ms ({1000/avg_time:.1f} FPS potential)")
         
         if use_qreader:
-            logger.info(f"[CAPTURE] Detection complete: {len(all_results)} QRs in {elapsed_total:.0f}ms")
-        
-        return all_results, len(all_results)
+            logger.info(f"[CAPTURE] Detection complete: {count} QRs in {elapsed_total:.0f}ms")
 
     def detect_async(self, frame, callback=None, use_qreader=False):
         """Non-blocking detection."""

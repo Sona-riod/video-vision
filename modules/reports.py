@@ -18,46 +18,54 @@ class ReportGenerator:
         if date is None:
             date = datetime.now().date()
         
+        batches, stats = self._fetch_report_data(date)
+        report = self._build_report_dict(date, batches, stats)
+        
+        filename = f"daily_report_{date.strftime('%Y%m%d')}"
+        if output_format == 'json':
+            filepath = self._save_report_json(report, filename)
+        elif output_format == 'csv':
+            filepath = self._save_report_csv(report, filename)
+        
+        print(f"Report saved to: {filepath}")
+        return report
+
+    def _fetch_report_data(self, date):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         
-        # Get batch data
-        cur.execute('''
-            SELECT 
-                session_id,
-                batch_status,
-                decodedqrcodes,
-                target_keg_count,
-                beer_type,
-                session_timestamp,
-                processing_time,
-                advanced_detection_used,
-                api_attempts,
-                last_error
-            FROM detection_sessions 
-            WHERE date(session_timestamp) = ?
-            ORDER BY session_timestamp DESC
-        ''', (date.strftime('%Y-%m-%d'),))
-        
-        batches = cur.fetchall()
-        
-        # Get summary statistics
-        cur.execute('''
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN batch_status = 'api_sent' THEN 1 ELSE 0 END) as successful,
-                SUM(CASE WHEN batch_status = 'api_failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN batch_status = 'duplicate' THEN 1 ELSE 0 END) as duplicates,
-                AVG(processing_time) as avg_time,
-                SUM(decodedqrcodes) as total_qrs
-            FROM detection_sessions 
-            WHERE date(session_timestamp) = ?
-        ''', (date.strftime('%Y-%m-%d'),))
-        
-        stats = cur.fetchone()
-        conn.close()
-        
-        # Build report
+        try:
+            # Get batch data
+            cur.execute('''
+                SELECT 
+                    session_id, batch_status, decodedqrcodes, target_keg_count,
+                    beer_type, session_timestamp, processing_time,
+                    advanced_detection_used, api_attempts, last_error
+                FROM detection_sessions 
+                WHERE date(session_timestamp) = ?
+                ORDER BY session_timestamp DESC
+            ''', (date.strftime('%Y-%m-%d'),))
+            batches = cur.fetchall()
+            
+            # Get summary statistics
+            cur.execute('''
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN batch_status = 'api_sent' THEN 1 ELSE 0 END) as successful,
+                    SUM(CASE WHEN batch_status = 'api_failed' THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN batch_status = 'duplicate' THEN 1 ELSE 0 END) as duplicates,
+                    AVG(processing_time) as avg_time,
+                    SUM(decodedqrcodes) as total_qrs
+                FROM detection_sessions 
+                WHERE date(session_timestamp) = ?
+            ''', (date.strftime('%Y-%m-%d'),))
+            stats = cur.fetchone()
+            
+            return batches, stats
+        finally:
+            conn.close()
+
+    def _build_report_dict(self, date, batches, stats):
         report = {
             'date': str(date),
             'generated_at': datetime.now().isoformat(),
@@ -66,7 +74,7 @@ class ReportGenerator:
                 'successful': stats[1] or 0,
                 'failed': stats[2] or 0,
                 'duplicates': stats[3] or 0,
-                'success_rate': round((stats[1] / stats[0] * 100) if stats[0] > 0 else 0, 1),
+                'success_rate': round((stats[1] / stats[0] * 100) if stats[0] and stats[0] > 0 else 0, 1),
                 'avg_processing_time': round(stats[4] or 0, 2),
                 'total_qr_codes': stats[5] or 0
             },
@@ -86,40 +94,38 @@ class ReportGenerator:
                 'api_attempts': batch[8] or 0,
                 'error': batch[9]
             })
-        
-        # Save report
-        filename = f"daily_report_{date.strftime('%Y%m%d')}"
-        
-        if output_format == 'json':
-            filepath = self.reports_dir / f"{filename}.json"
-            with open(filepath, 'w') as f:
-                json.dump(report, f, indent=2, default=str)
-        elif output_format == 'csv':
-            filepath = self.reports_dir / f"{filename}.csv"
-            with open(filepath, 'w', newline='') as f:
-                writer = csv.writer(f)
-                # Write header
-                writer.writerow(['Date', 'Batch ID', 'Status', 'QR Count', 'Target Count',
-                               'Beer Type', 'Time', 'Processing Time', 'Advanced Used',
-                               'API Attempts', 'Error'])
-                # Write data
-                for batch in report['batches']:
-                    writer.writerow([
-                        batch['time'],
-                        batch['id'],
-                        batch['status'],
-                        batch['qr_count'],
-                        batch['target_count'],
-                        batch['beer_type'],
-                        batch['time'],
-                        batch['processing_seconds'],
-                        batch['advanced_used'],
-                        batch['api_attempts'],
-                        batch['error'] or ''
-                    ])
-        
-        print(f"Report saved to: {filepath}")
         return report
+
+    def _save_report_json(self, report, filename):
+        filepath = self.reports_dir / f"{filename}.json"
+        with open(filepath, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        return filepath
+
+    def _save_report_csv(self, report, filename):
+        filepath = self.reports_dir / f"{filename}.csv"
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow(['Date', 'Batch ID', 'Status', 'QR Count', 'Target Count',
+                           'Beer Type', 'Time', 'Processing Time', 'Advanced Used',
+                           'API Attempts', 'Error'])
+            # Write data
+            for batch in report['batches']:
+                writer.writerow([
+                    batch['time'],
+                    batch['id'],
+                    batch['status'],
+                    batch['qr_count'],
+                    batch['target_count'],
+                    batch['beer_type'],
+                    batch['time'],
+                    batch['processing_seconds'],
+                    batch['advanced_used'],
+                    batch['api_attempts'],
+                    batch['error'] or ''
+                ])
+        return filepath
     
     def generate_operator_report(self):
         """Generate report for operator showing attention needed"""

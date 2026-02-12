@@ -158,108 +158,121 @@ class DatabaseManager:
             conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             
-            # Get current columns for detection_sessions
-            cur.execute("PRAGMA table_info(detection_sessions)")
-            columns = [row[1] for row in cur.fetchall()]
-            
-            # Add missing columns to detection_sessions
-            new_columns_detection = [
-                ('batch_status', "ALTER TABLE detection_sessions ADD COLUMN batch_status TEXT DEFAULT 'captured'"),
-                ('api_attempts', "ALTER TABLE detection_sessions ADD COLUMN api_attempts INTEGER DEFAULT 0"),
-                ('last_api_attempt', "ALTER TABLE detection_sessions ADD COLUMN last_api_attempt DATETIME"),
-                ('last_error', "ALTER TABLE detection_sessions ADD COLUMN last_error TEXT"),
-                ('api_payload', "ALTER TABLE detection_sessions ADD COLUMN api_payload TEXT"),
-                ('api_response', "ALTER TABLE detection_sessions ADD COLUMN api_response TEXT"),
-                ('require_attention', "ALTER TABLE detection_sessions ADD COLUMN require_attention INTEGER DEFAULT 0"),
-                ('attention_reason', "ALTER TABLE detection_sessions ADD COLUMN attention_reason TEXT"),
-                ('target_keg_count', "ALTER TABLE detection_sessions ADD COLUMN target_keg_count INTEGER DEFAULT 6"),
-                ('beer_type', "ALTER TABLE detection_sessions ADD COLUMN beer_type TEXT DEFAULT 'Lager'"),
-                ('api_status', "ALTER TABLE detection_sessions ADD COLUMN api_status TEXT DEFAULT 'pending'"),
-                ('batch', "ALTER TABLE detection_sessions ADD COLUMN batch TEXT"),
-                ('filling_date', "ALTER TABLE detection_sessions ADD COLUMN filling_date TEXT"),
-                ('pallet_id', "ALTER TABLE detection_sessions ADD COLUMN pallet_id TEXT"),
-            ]
-            
-            for col_name, sql in new_columns_detection:
-                if col_name not in columns:
-                    try:
-                        cur.execute(sql)
-                        print(f"[DB] Added column to detection_sessions: {col_name}")
-                    except Exception as e:
-                        print(f"[DB] Error adding {col_name} to detection_sessions: {e}")
-            
-            # Get current columns for decoded_data
-            cur.execute("PRAGMA table_info(decoded_data)")
-            columns = [row[1] for row in cur.fetchall()]
-            
-            # Add keg_type column to decoded_data if not exists
-            if 'keg_type' not in columns:
-                try:
-                    cur.execute("ALTER TABLE decoded_data ADD COLUMN keg_type TEXT DEFAULT 'Unknown'")
-                    print(f"[DB] Added column to decoded_data: keg_type")
-                except Exception as e:
-                    print(f"[DB] Error adding keg_type to decoded_data: {e}")
-            
-            # Check and rename system_events column if needed
-            cur.execute("PRAGMA table_info(system_events)")
-            columns = [row[1] for row in cur.fetchall()]
-            
-            # If old column exists and new one doesn't, rename
-            if 'created_at' in columns and 'timestamp' not in columns:
-                try:
-                    # SQLite doesn't support direct column rename, so we need to recreate
-                    cur.execute('''
-                        CREATE TABLE system_events_new (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            event_type TEXT NOT NULL,
-                            details TEXT,
-                            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                        )
-                    ''')
-                    cur.execute('''
-                        INSERT INTO system_events_new (id, event_type, details, timestamp)
-                        SELECT id, event_type, details, created_at FROM system_events
-                    ''')
-                    cur.execute('DROP TABLE system_events')
-                    cur.execute('ALTER TABLE system_events_new RENAME TO system_events')
-                    print("[DB] Migrated system_events table")
-                except Exception as e:
-                    print(f"[DB] Error migrating system_events: {e}")
-            
-            # Migrate existing data for status
             try:
-                cur.execute("UPDATE detection_sessions SET batch_status = 'api_sent' WHERE api_status = 'success'")
-                cur.execute("UPDATE detection_sessions SET batch_status = 'api_failed' WHERE api_status = 'failed'")
-                cur.execute("UPDATE detection_sessions SET batch_status = 'api_pending' WHERE api_status = 'pending'")
-            except Exception as e:
-                print(f"[DB] Migration error: {e}")
-            
-            # Create pallet_lifecycle table if not exists
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pallet_lifecycle'")
-            if not cur.fetchone():
+                self._migrate_detection_sessions(cur)
+                self._migrate_decoded_data(cur)
+                self._migrate_system_events(cur)
+                self._migrate_batch_status(cur)
+                self._create_pallet_lifecycle_table(cur)
+                
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _migrate_detection_sessions(self, cur):
+        # Get current columns for detection_sessions
+        cur.execute("PRAGMA table_info(detection_sessions)")
+        columns = [row[1] for row in cur.fetchall()]
+        
+        # Add missing columns to detection_sessions
+        new_columns_detection = [
+            ('batch_status', "ALTER TABLE detection_sessions ADD COLUMN batch_status TEXT DEFAULT 'captured'"),
+            ('api_attempts', "ALTER TABLE detection_sessions ADD COLUMN api_attempts INTEGER DEFAULT 0"),
+            ('last_api_attempt', "ALTER TABLE detection_sessions ADD COLUMN last_api_attempt DATETIME"),
+            ('last_error', "ALTER TABLE detection_sessions ADD COLUMN last_error TEXT"),
+            ('api_payload', "ALTER TABLE detection_sessions ADD COLUMN api_payload TEXT"),
+            ('api_response', "ALTER TABLE detection_sessions ADD COLUMN api_response TEXT"),
+            ('require_attention', "ALTER TABLE detection_sessions ADD COLUMN require_attention INTEGER DEFAULT 0"),
+            ('attention_reason', "ALTER TABLE detection_sessions ADD COLUMN attention_reason TEXT"),
+            ('target_keg_count', "ALTER TABLE detection_sessions ADD COLUMN target_keg_count INTEGER DEFAULT 6"),
+            ('beer_type', "ALTER TABLE detection_sessions ADD COLUMN beer_type TEXT DEFAULT 'Lager'"),
+            ('api_status', "ALTER TABLE detection_sessions ADD COLUMN api_status TEXT DEFAULT 'pending'"),
+            ('batch', "ALTER TABLE detection_sessions ADD COLUMN batch TEXT"),
+            ('filling_date', "ALTER TABLE detection_sessions ADD COLUMN filling_date TEXT"),
+            ('pallet_id', "ALTER TABLE detection_sessions ADD COLUMN pallet_id TEXT"),
+        ]
+        
+        for col_name, sql in new_columns_detection:
+            if col_name not in columns:
                 try:
-                    cur.execute('''
-                        CREATE TABLE IF NOT EXISTS pallet_lifecycle (
-                            pallet_id TEXT PRIMARY KEY,
-                            session_id TEXT,
-                            keg_type TEXT,
-                            keg_count INTEGER,
-                            qr_codes TEXT,
-                            status TEXT DEFAULT 'CREATED',
-                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                            shipped_at DATETIME,
-                            last_modified DATETIME DEFAULT CURRENT_TIMESTAMP,
-                            qr_generated INTEGER DEFAULT 0,
-                            qr_data TEXT,
-                            FOREIGN KEY (session_id) REFERENCES detection_sessions(session_id)
-                        )
-                    ''')
-                    print("[DB] Created pallet_lifecycle table")
+                    cur.execute(sql)
+                    print(f"[DB] Added column to detection_sessions: {col_name}")
                 except Exception as e:
-                    print(f"[DB] Error creating pallet_lifecycle table: {e}")
-            
-            conn.commit()
-            conn.close()
+                    print(f"[DB] Error adding {col_name} to detection_sessions: {e}")
+
+    def _migrate_decoded_data(self, cur):
+        # Get current columns for decoded_data
+        cur.execute("PRAGMA table_info(decoded_data)")
+        columns = [row[1] for row in cur.fetchall()]
+        
+        # Add keg_type column to decoded_data if not exists
+        if 'keg_type' not in columns:
+            try:
+                cur.execute("ALTER TABLE decoded_data ADD COLUMN keg_type TEXT DEFAULT 'Unknown'")
+                print(f"[DB] Added column to decoded_data: keg_type")
+            except Exception as e:
+                print(f"[DB] Error adding keg_type to decoded_data: {e}")
+
+    def _migrate_system_events(self, cur):
+        # Check and rename system_events column if needed
+        cur.execute("PRAGMA table_info(system_events)")
+        columns = [row[1] for row in cur.fetchall()]
+        
+        # If old column exists and new one doesn't, rename
+        if 'created_at' in columns and 'timestamp' not in columns:
+            try:
+                # SQLite doesn't support direct column rename, so we need to recreate
+                cur.execute('''
+                    CREATE TABLE system_events_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_type TEXT NOT NULL,
+                        details TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cur.execute('''
+                    INSERT INTO system_events_new (id, event_type, details, timestamp)
+                    SELECT id, event_type, details, created_at FROM system_events
+                ''')
+                cur.execute('DROP TABLE system_events')
+                cur.execute('ALTER TABLE system_events_new RENAME TO system_events')
+                print("[DB] Migrated system_events table")
+            except Exception as e:
+                print(f"[DB] Error migrating system_events: {e}")
+
+    def _migrate_batch_status(self, cur):
+        # Migrate existing data for status
+        try:
+            cur.execute("UPDATE detection_sessions SET batch_status = 'api_sent' WHERE api_status = 'success'")
+            cur.execute("UPDATE detection_sessions SET batch_status = 'api_failed' WHERE api_status = 'failed'")
+            cur.execute("UPDATE detection_sessions SET batch_status = 'api_pending' WHERE api_status = 'pending'")
+        except Exception as e:
+            print(f"[DB] Migration error: {e}")
+
+    def _create_pallet_lifecycle_table(self, cur):
+        # Create pallet_lifecycle table if not exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pallet_lifecycle'")
+        if not cur.fetchone():
+            try:
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS pallet_lifecycle (
+                        pallet_id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        keg_type TEXT,
+                        keg_count INTEGER,
+                        qr_codes TEXT,
+                        status TEXT DEFAULT 'CREATED',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        shipped_at DATETIME,
+                        last_modified DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        qr_generated INTEGER DEFAULT 0,
+                        qr_data TEXT,
+                        FOREIGN KEY (session_id) REFERENCES detection_sessions(session_id)
+                    )
+                ''')
+                print("[DB] Created pallet_lifecycle table")
+            except Exception as e:
+                print(f"[DB] Error creating pallet_lifecycle table: {e}")
 
     def _next_batch_number(self) -> int:
         with db_lock:

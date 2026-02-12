@@ -23,6 +23,44 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
                  required_count: int, composition=None, beer_type="", 
                  batch: str = None, keg_type: str = None, filling_date: str = None):
     """Process a single batch with enhanced error handling and tracking"""
+    _log_start(session_id, frame_path, image_name, required_count, beer_type, batch, keg_type)
+    
+    start = time.time()
+    db.update_batch_status(session_id, 'processing', require_attention=False, attention_reason="Processing started")
+    
+    try:
+        frame = _load_frame(frame_path, session_id)
+        if frame is None:
+            return
+
+        qr_strings, std_dets, method, adv_used, adv_found = _run_detection(frame, frame_path, required_count, session_id)
+        
+        filling_date = datetime.now().isoformat()
+        keg_types = [db.get_keg_type(qr_data) for qr_data in qr_strings]
+        
+        already = _check_and_log_duplicates(qr_strings, required_count, session_id)
+        
+        new_global, decoded_cnt = db.store_qr_codes(session_id, qr_strings, method, std_dets, keg_types)
+        
+        _check_batch_miss(decoded_cnt, required_count, session_id)
+        
+        if composition is None:
+            composition = {'Unknown': decoded_cnt}
+            
+        db.mark_pallet_processed(qr_strings, session_id, required_count)
+        
+        payload, qr_list_db, ts_db = _prepare_api_payload(session_id, decoded_cnt, required_count, batch, beer_type, filling_date, qr_strings)
+        
+        api_success = False
+        if payload:
+            api_success = _send_api_request(session_id, qr_list_db, payload, image_name, ts_db, required_count)
+
+        _finalize_session(session_id, start, adv_used, adv_found, decoded_cnt, std_dets, api_success, frame_path, already, method, required_count)
+
+    except Exception as e:
+        _handle_process_exception(session_id, start, frame_path, e)
+
+def _log_start(session_id, frame_path, image_name, required_count, beer_type, batch, keg_type):
     print("\n" + "="*60)
     print("_PROCESS_ONE STARTED (Background Thread)")
     print("="*60)
@@ -33,249 +71,196 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
     print(f"  Beer Type: {beer_type}")
     print(f"  Batch: {batch}")
     print(f"  Keg Type: {keg_type}")
-    
-    start = time.time()
     log.info(f"[{session_id}] Pallet processing started - Target: {required_count} kegs, Beer: {beer_type}, Batch: {batch}")
+
+def _load_frame(frame_path, session_id):
+    print("  -> Loading frame from disk...")
+    frame = cv2.imread(frame_path)
+    if frame is None:
+        error_msg = f"Cannot read frame: {frame_path}"
+        print(f"  -> ERROR: {error_msg}")
+        log.error(f"[{session_id}] {error_msg}")
+        db.finish_session(session_id, 0.01, 0, 0, 0, 0, False)
+        db.update_batch_status(session_id, 'api_failed', error_msg, 
+                             require_attention=True, 
+                             attention_reason="Frame read error")
+        db.mark_for_attention(session_id, "Frame read error")
+        return None
+    print(f"  -> Frame loaded: {frame.shape}")
+    return frame
+
+def _run_detection(frame, frame_path, required_count, session_id):
+    print("  -> Running standard QR detection...")
+    std_qrs, std_dets = detect_qr_standard(frame)
+    print(f"  -> Standard QR detection: found {len(std_qrs)} QRs")
     
-    # Update status to processing
-    print("  -> Updating batch status to 'processing'...")
-    db.update_batch_status(session_id, 'processing', 
-                          require_attention=False, 
-                          attention_reason="Processing started")
+    method = "normal"
+    adv_used = 0
+    adv_found = 0
     
-    try:
-        # Load frame
-        print("  -> Loading frame from disk...")
-        frame = cv2.imread(frame_path)
-        if frame is None:
-            error_msg = f"Cannot read frame: {frame_path}"
-            print(f"  -> ERROR: {error_msg}")
-            log.error(f"[{session_id}] {error_msg}")
-            db.finish_session(session_id, 0.01, 0, 0, 0, 0, False)
-            db.update_batch_status(session_id, 'api_failed', error_msg, 
-                                 require_attention=True, 
-                                 attention_reason="Frame read error")
-            db.mark_for_attention(session_id, "Frame read error")
-            return
-        print(f"  -> Frame loaded: {frame.shape}")
-
-        # Step 1: Standard QR detection
-        print("  -> Running standard QR detection...")
-        std_qrs, std_dets = detect_qr_standard(frame)
-        print(f"  -> Standard QR detection: found {len(std_qrs)} QRs")
-        method = "normal"
-        adv_used = 0
-        adv_found = 0
-
-        # Step 2: Advanced detection if needed
-        if len(std_qrs) < required_count:
-            print(f"\n[PROCESS] Standard detection found {len(std_qrs)}/{required_count} QRs - Triggering ADVANCED DETECTION...")
-            log.info(f"[{session_id}] Standard → {len(std_qrs)} QR(s), using advanced detection")
-            try:
-                std_qrs, adv_found = detect_qr_advanced(frame_path)
-                print(f"[PROCESS] Standard + Advanced Combined: {adv_found} QRs")
-                method = "advanced"
-                adv_used = 1
-                std_dets = adv_found
-                log.info(f"[{session_id}] Advanced detection found {adv_found} QR(s)")
-            except Exception as e:
-                error_msg = f"Advanced detection failed: {str(e)}"
-                log.error(f"[{session_id}] {error_msg}")
-                db.update_batch_status(session_id, 'api_failed', error_msg,
-                                     require_attention=True,
-                                     attention_reason="Advanced detection error")
-                db.mark_for_attention(session_id, "Advanced detection error")
-                # Don't raise - continue with partial results
-                # The batch miss check below will handle it
-
-        # Auto filling date/time
-        filling_date = datetime.now().isoformat()
-        
-        # Extract purely the data strings for database operations
-        qr_strings = [qr['data'] if isinstance(qr, dict) else qr for qr in std_qrs]
-        print(f"  -> QR Strings for DB: {qr_strings}")
-        
-        # Get keg types for each QR code
-        keg_types = [db.get_keg_type(qr_data) for qr_data in qr_strings]
-        
-
-
-        # Step 3: Check for duplicates
-        print(f"  -> Checking for duplicates with: {qr_strings}")
-        already, old_session_id = db.is_pallet_processed(qr_strings, required_count)
-        print(f"  -> Duplicate check result: already={already}, old_session_id={old_session_id}")
-        
-        # NON-BLOCKING DUPLICATE CHECK
-        if already:
-            try:
-                old_info = db.get_batch_status(old_session_id)
-                old_user_batch = old_info.get('batch', '')
-                log.warning(f"[{session_id}] Duplicate QRs detected (previous: {old_session_id} / Batch: {old_user_batch})")
-                log.warning(f"[{session_id}] Proceeding anyway per user request (Reference Mode)")
-                
-                # Update status for tracking, but don't return
-                db.update_batch_status(session_id, 'processing', 
-                                      f"Warning: Duplicate of {old_session_id}",
-                                      require_attention=False)
-            except Exception as e:
-                log.error(f"[{session_id}] Duplicate check error: {e}")
-        
-        # Continue execution...
-
-
-
-        # Step 4: Store QR codes with keg types
-        new_global, decoded_cnt = db.store_qr_codes(
-            session_id, qr_strings, method, std_dets, keg_types
-        )
-        
-        # Check for batch miss (insufficient QR codes)
-        if decoded_cnt < required_count:
-            error_msg = f"Batch miss: Decoded {decoded_cnt}/{required_count} QRs"
-            log.warning(f"[{session_id}] {error_msg}")
-            db.update_batch_status(session_id, 'api_failed', error_msg,
-                                 require_attention=True,
-                                 attention_reason="Batch miss - incomplete QRs")
-            db.mark_for_attention(session_id, error_msg)
-            # Still continue - might want to send partial data
-        
-        # Prepare composition if not provided
-        if composition is None:
-            composition = {'Unknown': decoded_cnt}
-        
-        # Mark pallet as processed
-        db.mark_pallet_processed(qr_strings, session_id, required_count)
-        
-        # Step 5: Send to API
-        print("\n" + "-"*40)
-        print("STEP 5: PREPARING API PAYLOAD")
-        print("-"*40)
-        log.info(f"[{session_id}] Ready for API - {decoded_cnt}/{required_count} QR codes")
-        
-        # Get session data for timestamp
-        print("  -> Getting session data from database...")
-        qr_list_db, ts_db = db.get_session_data(session_id)
-        if not qr_list_db or not isinstance(qr_list_db, list):
-            print("  -> WARNING: DB QR list invalid, using local list")
-            log.warning(f"[{session_id}] DB QR list invalid, using local list")
-            qr_list_db = qr_strings
-            ts_db = datetime.now()
-        print(f"  -> QR list from DB: {len(qr_list_db)} codes")
-        print(f"  -> QR codes: {qr_list_db}")
-        
-        # Validate QR Data before sending
-        if not qr_list_db:
-            print("  -> ERROR: No QR codes detected - skipping API call")
-            log.warning(f"[{session_id}] Skipping API: No QR codes detected (Empty Batch)")
-            db.update_batch_status(session_id, 'api_failed', "Empty batch - not sent")
-            return
-        
-        print("  -> Constructing payload...")
-        payload = {
-            "macId": CAMERA_MAC_ID,
-            "kegIds": qr_list_db,
-            "kegCount": decoded_cnt,
-            "batch": batch,
-            "beerType": beer_type,
-            "fillingDate": filling_date,
-            "timestamp": ts_db.isoformat() if hasattr(ts_db, 'isoformat') else datetime.now().isoformat()
-        }
-        print(f"  -> Payload constructed:")
-        import json as _json
-        print(_json.dumps(payload, indent=4, default=str))
-        
-        # Store API payload for retry capability
-        print("  -> Storing payload for retry capability...")
-        db.store_api_payload(session_id, payload)
-        
-        # Send to API
-        print("\n" + "-"*40)
-        print("STEP 6: CALLING API_SENDER.SEND_BATCH")
-        print("-"*40)
+    if len(std_qrs) < required_count:
+        print(f"\n[PROCESS] Standard detection found {len(std_qrs)}/{required_count} QRs - Triggering ADVANCED DETECTION...")
+        log.info(f"[{session_id}] Standard → {len(std_qrs)} QR(s), using advanced detection")
         try:
-            # Send with extended parameters
-            print("  -> Calling api_sender.send_batch()...")
-            api_success = api_sender.send_batch(
-                batch_id=session_id,
-                qr_codes=qr_list_db,
-                payload=payload,
-                image_name=image_name,
-                timestamp=ts_db,
-                required_count=required_count
-            )
-            print(f"  -> api_sender.send_batch returned: {api_success}")
-            
-            if api_success:
-                print("  -> SUCCESS: Batch sent to API")
-                log.info(f"[{session_id}] Batch sent - awaiting pallet QR from cloud")
-                # Remove from retry queue if successful
-                db.remove_from_retry_queue(session_id)
-            else:
-                print("  -> FAILED: API send returned False")
-                log.error(f"[{session_id}] API send failed")
-                db.mark_for_attention(session_id, "API send failure")
-                # Add to retry queue
-                db.add_to_retry_queue(session_id, payload, "API send failed")
-                
+            std_qrs, adv_found = detect_qr_advanced(frame_path)
+            print(f"[PROCESS] Standard + Advanced Combined: {adv_found} QRs")
+            method = "advanced"
+            adv_used = 1
+            std_dets = adv_found
+            log.info(f"[{session_id}] Advanced detection found {adv_found} QR(s)")
         except Exception as e:
-            error_msg = f"API send error: {str(e)}"
-            print(f"  -> EXCEPTION in send_batch: {e}")
-            log.critical(f"[{session_id}] {error_msg}")
-            traceback.print_exc()
-            api_success = False
+            error_msg = f"Advanced detection failed: {str(e)}"
+            log.error(f"[{session_id}] {error_msg}")
             db.update_batch_status(session_id, 'api_failed', error_msg,
                                  require_attention=True,
-                                 attention_reason="API send exception")
-            db.mark_for_attention(session_id, error_msg)
-            # Add to retry queue
-            db.add_to_retry_queue(session_id, payload, error_msg)
+                                 attention_reason="Advanced detection error")
+            db.mark_for_attention(session_id, "Advanced detection error")
+    
+    qr_strings = [qr['data'] if isinstance(qr, dict) else qr for qr in std_qrs]
+    print(f"  -> QR Strings for DB: {qr_strings}")
+    return qr_strings, std_dets, method, adv_used, adv_found
 
-        # Calculate processing time
-        elapsed = time.time() - start
-        
-        # Update session completion
-        db.finish_session(session_id, elapsed, adv_used, adv_found, 
-                         decoded_cnt, std_dets, api_success)
-        
-        # Update final status
-        if api_success:
-            db.update_batch_status(session_id, 'api_sent',
-                                 require_attention=False)
-            # Clean up frame if successful
-            if os.path.exists(frame_path):
-                try:
-                    os.remove(frame_path)
-                    log.debug(f"[{session_id}] Removed processed frame")
-                except Exception as e:
-                    log.warning(f"[{session_id}] Failed to remove frame: {e}")
-        elif not already:  # Not a duplicate and API failed
-            db.update_batch_status(session_id, 'api_failed', 
-                                 "API send failed",
-                                 require_attention=True,
-                                 attention_reason="API failure")
-            db.mark_for_attention(session_id, "API failure")
+def _check_and_log_duplicates(qr_strings, required_count, session_id):
+    print(f"  -> Checking for duplicates with: {qr_strings}")
+    already, old_session_id = db.is_pallet_processed(qr_strings, required_count)
+    print(f"  -> Duplicate check result: already={already}, old_session_id={old_session_id}")
+    
+    if already:
+        try:
+            old_info = db.get_batch_status(old_session_id)
+            old_user_batch = old_info.get('batch', '')
+            log.warning(f"[{session_id}] Duplicate QRs detected (previous: {old_session_id} / Batch: {old_user_batch})")
+            log.warning(f"[{session_id}] Proceeding anyway per user request (Reference Mode)")
+            
+            db.update_batch_status(session_id, 'processing', 
+                                  f"Warning: Duplicate of {old_session_id}",
+                                  require_attention=False)
+        except Exception as e:
+            log.error(f"[{session_id}] Duplicate check error: {e}")
+    return already
 
-        # Log final status
-        status = "COMPLETE" if decoded_cnt >= required_count else "INCOMPLETE"
-        api_status = "SUCCESS" if api_success else "FAILED"
-        log.info(f"[{session_id}] {method.upper()} | {decoded_cnt}/{required_count} | "
-                f"API:{api_status} | {elapsed:.2f}s | {status}")
-
-    except Exception as e:
-        # Catch-all for unexpected errors
-        error_msg = f"Unexpected processing error: {str(e)}"
-        log.critical(f"[{session_id}] {error_msg}")
-        traceback.print_exc()
-        
-        elapsed = time.time() - start
-        db.finish_session(session_id, elapsed, 0, 0, 0, 0, False)
+def _check_batch_miss(decoded_cnt, required_count, session_id):
+    if decoded_cnt < required_count:
+        error_msg = f"Batch miss: Decoded {decoded_cnt}/{required_count} QRs"
+        log.warning(f"[{session_id}] {error_msg}")
         db.update_batch_status(session_id, 'api_failed', error_msg,
                              require_attention=True,
-                             attention_reason="Processing crashed")
+                             attention_reason="Batch miss - incomplete QRs")
         db.mark_for_attention(session_id, error_msg)
+
+def _prepare_api_payload(session_id, decoded_cnt, required_count, batch, beer_type, filling_date, qr_strings):
+    print("\n" + "-"*40)
+    print("STEP 5: PREPARING API PAYLOAD")
+    print("-"*40)
+    log.info(f"[{session_id}] Ready for API - {decoded_cnt}/{required_count} QR codes")
+    
+    print("  -> Getting session data from database...")
+    qr_list_db, ts_db = db.get_session_data(session_id)
+    if not qr_list_db or not isinstance(qr_list_db, list):
+        print("  -> WARNING: DB QR list invalid, using local list")
+        log.warning(f"[{session_id}] DB QR list invalid, using local list")
+        qr_list_db = qr_strings
+        ts_db = datetime.now()
+    
+    if not qr_list_db:
+        print("  -> ERROR: No QR codes detected - skipping API call")
+        log.warning(f"[{session_id}] Skipping API: No QR codes detected (Empty Batch)")
+        db.update_batch_status(session_id, 'api_failed', "Empty batch - not sent")
+        return None, None, None
+
+    print("  -> Constructing payload...")
+    payload = {
+        "macId": CAMERA_MAC_ID,
+        "kegIds": qr_list_db,
+        "kegCount": decoded_cnt,
+        "batch": batch,
+        "beerType": beer_type,
+        "fillingDate": filling_date,
+        "timestamp": ts_db.isoformat() if hasattr(ts_db, 'isoformat') else datetime.now().isoformat()
+    }
+    
+    import json as _json
+    print(f"  -> Payload constructed:\n{_json.dumps(payload, indent=4, default=str)}")
+    
+    print("  -> Storing payload for retry capability...")
+    db.store_api_payload(session_id, payload)
+    
+    return payload, qr_list_db, ts_db
+
+def _send_api_request(session_id, qr_list_db, payload, image_name, ts_db, required_count):
+    print("\n" + "-"*40)
+    print("STEP 6: CALLING API_SENDER.SEND_BATCH")
+    print("-"*40)
+    try:
+        print("  -> Calling api_sender.send_batch()...")
+        api_success = api_sender.send_batch(
+            batch_id=session_id,
+            qr_codes=qr_list_db,
+            payload=payload,
+            image_name=image_name,
+            timestamp=ts_db,
+            required_count=required_count
+        )
+        print(f"  -> api_sender.send_batch returned: {api_success}")
         
-        # Don't delete frame on crash for recovery
-        log.warning(f"[{session_id}] Frame preserved for recovery: {frame_path}")
+        if api_success:
+            print("  -> SUCCESS: Batch sent to API")
+            log.info(f"[{session_id}] Batch sent - awaiting pallet QR from cloud")
+            db.remove_from_retry_queue(session_id)
+        else:
+            print("  -> FAILED: API send returned False")
+            log.error(f"[{session_id}] API send failed")
+            db.mark_for_attention(session_id, "API send failure")
+            db.add_to_retry_queue(session_id, payload, "API send failed")
+        return api_success
+            
+    except Exception as e:
+        error_msg = f"API send error: {str(e)}"
+        print(f"  -> EXCEPTION in send_batch: {e}")
+        log.critical(f"[{session_id}] {error_msg}")
+        traceback.print_exc()
+        db.update_batch_status(session_id, 'api_failed', error_msg,
+                             require_attention=True,
+                             attention_reason="API send exception")
+        db.mark_for_attention(session_id, error_msg)
+        db.add_to_retry_queue(session_id, payload, error_msg)
+        return False
+
+def _finalize_session(session_id, start, adv_used, adv_found, decoded_cnt, std_dets, api_success, frame_path, already, method, required_count):
+    elapsed = time.time() - start
+    db.finish_session(session_id, elapsed, adv_used, adv_found, decoded_cnt, std_dets, api_success)
+    
+    if api_success:
+        db.update_batch_status(session_id, 'api_sent', require_attention=False)
+        if os.path.exists(frame_path):
+            try:
+                os.remove(frame_path)
+                log.debug(f"[{session_id}] Removed processed frame")
+            except Exception as e:
+                log.warning(f"[{session_id}] Failed to remove frame: {e}")
+    elif not already:
+        db.update_batch_status(session_id, 'api_failed', "API send failed",
+                             require_attention=True, attention_reason="API failure")
+        db.mark_for_attention(session_id, "API failure")
+
+    status = "COMPLETE" if decoded_cnt >= required_count else "INCOMPLETE"
+    api_status = "SUCCESS" if api_success else "FAILED"
+    log.info(f"[{session_id}] {method.upper()} | {decoded_cnt}/{required_count} | API:{api_status} | {elapsed:.2f}s | {status}")
+
+def _handle_process_exception(session_id, start, frame_path, e):
+    error_msg = f"Unexpected processing error: {str(e)}"
+    log.critical(f"[{session_id}] {error_msg}")
+    traceback.print_exc()
+    
+    elapsed = time.time() - start
+    db.finish_session(session_id, elapsed, 0, 0, 0, 0, False)
+    db.update_batch_status(session_id, 'api_failed', error_msg,
+                         require_attention=True,
+                         attention_reason="Processing crashed")
+    db.mark_for_attention(session_id, error_msg)
+    
+    # Don't delete frame on crash for recovery
+    log.warning(f"[{session_id}] Frame preserved for recovery: {frame_path}")
 
 def submit_batch(frame_path: str, image_name: str, session_id: str, 
                  required_count: int = 6, keg_type: str = None, 

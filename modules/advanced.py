@@ -71,6 +71,11 @@ class AdvancedQRDetector:
                 break
         
         # Add right and bottom edge tiles
+        self._add_edge_tiles(tile_positions, img_w, img_h, step_x, step_y)
+        
+        return sorted(list(set(tile_positions)))
+
+    def _add_edge_tiles(self, tile_positions, img_w, img_h, step_x, step_y):
         if img_w > self.slice_width:
             right_x = max(0, img_w - self.slice_width)
             for y in range(0, img_h, step_y):
@@ -84,8 +89,6 @@ class AdvancedQRDetector:
         if img_w > self.slice_width and img_h > self.slice_height:
             corner_pos = (max(0, img_w - self.slice_width), max(0, img_h - self.slice_height))
             tile_positions.append(corner_pos)
-        
-        return sorted(list(set(tile_positions)))
 
     def _save_tile(self, image, x, y, img_w, img_h, output_dir, tile_count):
         x_end = min(x + self.slice_width, img_w)
@@ -290,29 +293,37 @@ class AdvancedQRDetector:
 
     def _decode_cropped_images(self, all_cropped_paths, unique_qr_codes):
         logger.info("Advanced: Step 3 - Decoding QR codes...")
-        decoded_count = 0
         
         for cropped_img in all_cropped_paths:
-            # Try QReader first
-            qr_results = self.decode_qr_qreader(cropped_img)
-            for qr in qr_results:
-                if qr not in unique_qr_codes:
-                    unique_qr_codes.add(qr)
-                    decoded_count += 1
-                    logger.info(f"Advanced: QReader decoded: {qr[:50]}{'...' if len(qr) > 50 else ''}")
-            
-            # Try pyzbar as backup
-            image = cv2.imread(cropped_img)
-            if image is not None:
-                decoded_objects, success = self.decode_qr_pyzbar(image)
-                if success:
-                    for obj in decoded_objects:
-                        qr_data = obj.data.decode('utf-8').strip()
-                        if qr_data and qr_data not in unique_qr_codes:
-                            unique_qr_codes.add(qr_data)
-                            decoded_count += 1
-                            logger.info(f"Advanced: pyzbar decoded: {qr_data[:50]}{'...' if len(qr_data) > 50 else ''}")
+            self._process_single_crop(cropped_img, unique_qr_codes)
+
         return unique_qr_codes
+
+    def _process_single_crop(self, cropped_img, unique_qr_codes):
+        # Try QReader first
+        qr_results = self.decode_qr_qreader(cropped_img)
+        for qr in qr_results:
+            self._add_unique_qr(qr, unique_qr_codes, "QReader")
+            
+        # Try pyzbar as backup
+        self._detect_with_pyzbar_fallback(cropped_img, unique_qr_codes)
+
+    def _detect_with_pyzbar_fallback(self, cropped_img, unique_qr_codes):
+        image = cv2.imread(cropped_img)
+        if image is None:
+            return
+
+        decoded_objects, success = self.decode_qr_pyzbar(image)
+        if success:
+            for obj in decoded_objects:
+                qr_data = obj.data.decode('utf-8').strip()
+                if qr_data:
+                    self._add_unique_qr(qr_data, unique_qr_codes, "pyzbar")
+
+    def _add_unique_qr(self, qr_text, unique_qr_codes, source):
+        if qr_text not in unique_qr_codes:
+            unique_qr_codes.add(qr_text)
+            logger.info(f"Advanced: {source} decoded: {qr_text[:50]}{'...' if len(qr_text) > 50 else ''}")
 
 # Standalone function for external use (as in your initial)
 def run_advanced_detection(image_path, model_path=None):

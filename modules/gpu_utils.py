@@ -104,40 +104,56 @@ class GPUInfo:
         # Check for Metal via PyTorch MPS
         try:
             import torch
-            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                self.mps_available = True
-                GPU_STATUS['mps_available'] = True
-                GPU_STATUS['torch_device'] = 'mps'
-                GPU_STATUS['gpu_name'] = 'Apple Metal GPU'
-                
-                # Get Mac GPU info via subprocess
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ['system_profiler', 'SPDisplaysDataType'],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    for line in result.stdout.split('\n'):
-                        if 'Chipset Model' in line or 'Chip' in line:
-                            gpu_name = line.split(':')[-1].strip()
-                            if gpu_name:
-                                GPU_STATUS['gpu_name'] = gpu_name
-                                self.cuda_device_name = gpu_name
-                                break
-                except Exception:
-                    pass
-                
-                print(f"[✓] PyTorch MPS (Metal): AVAILABLE")
-                print(f"    - GPU: {GPU_STATUS['gpu_name']}")
-                logger.info(f"Mac Metal GPU enabled: {GPU_STATUS['gpu_name']}")
+            if self._is_mps_available(torch):
+                self._enable_mps(logger)
             else:
-                print("[✗] PyTorch MPS: NOT AVAILABLE")
-                print("    - Requires macOS 12.3+ and Apple Silicon or AMD GPU")
-                logger.warning("MPS not available - using CPU")
+                self._handle_mps_unavailable(logger)
         except ImportError:
-            print("[!] PyTorch: NOT INSTALLED")
+            print("PyTorch: NOT INSTALLED")
         except Exception as e:
-            print(f"[!] MPS Detection Error: {e}")
+            print("MPS Detection Error: {e}")
+
+    def _is_mps_available(self, torch):
+        """Check if PyTorch MPS is available."""
+        return hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+
+    def _enable_mps(self, logger):
+        """Enable MPS and update status."""
+        self.mps_available = True
+        GPU_STATUS['mps_available'] = True
+        GPU_STATUS['torch_device'] = 'mps'
+        GPU_STATUS['gpu_name'] = 'Apple Metal GPU'
+        
+        # Get Mac GPU info via subprocess
+        gpu_name = self._get_mac_gpu_name_from_system()
+        if gpu_name:
+            GPU_STATUS['gpu_name'] = gpu_name
+            self.cuda_device_name = gpu_name
+        
+        print("PyTorch MPS (Metal): AVAILABLE")
+        print("GPU: {GPU_STATUS['gpu_name']}")
+        logger.info(f"Mac Metal GPU enabled: {GPU_STATUS['gpu_name']}")
+
+    def _handle_mps_unavailable(self, logger):
+        """Handle case where MPS is not available."""
+        print("PyTorch MPS: NOT AVAILABLE")
+        print("    - Requires macOS 12.3+ and Apple Silicon or AMD GPU")
+        logger.warning("MPS not available - using CPU")
+
+    def _get_mac_gpu_name_from_system(self):
+        """Retrieve Mac GPU name using system_profiler."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['system_profiler', 'SPDisplaysDataType'],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.split('\n'):
+                if 'Chipset Model' in line or 'Chip' in line:
+                    return line.split(':')[-1].strip()
+        except Exception:
+            pass
+        return None
 
     def _detect_cuda_opencv(self, logger):
         """Detect OpenCV CUDA support (Linux/Windows)."""
@@ -151,16 +167,16 @@ class GPUInfo:
                 
                 cv2.cuda.setDevice(0)
                 
-                print(f"[✓] OpenCV CUDA: ENABLED")
-                print(f"    - CUDA Devices Found: {cuda_count}")
+                print("OpenCV CUDA: ENABLED")
+                print(f"CUDA Devices Found: {cuda_count}")
                 logger.info(f"OpenCV CUDA enabled with {cuda_count} device(s)")
             else:
-                print(f"[✗] OpenCV CUDA: NOT AVAILABLE")
-                print(f"    - OpenCV compiled WITHOUT CUDA support")
+                print("OpenCV CUDA: NOT AVAILABLE")
+                print("OpenCV compiled WITHOUT CUDA support")
                 logger.warning("OpenCV CUDA not available - using CPU fallback")
                 
         except Exception as e:
-            print(f"[✗] OpenCV CUDA: ERROR - {e}")
+            print(f"OpenCV CUDA: ERROR - {e}")
             logger.error(f"OpenCV CUDA detection failed: {e}")
 
     def _detect_pytorch_cuda(self, logger):
@@ -177,12 +193,12 @@ class GPUInfo:
                 self.cuda_device_name = GPU_STATUS['gpu_name']
                 self.cuda_available = True
                 
-                print(f"[✓] PyTorch CUDA: AVAILABLE")
-                print(f"    - GPU Name: {GPU_STATUS['gpu_name']}")
+                print("PyTorch CUDA: AVAILABLE")
+                print(f"GPU Name: {GPU_STATUS['gpu_name']}")
             else:
-                print(f"[!] PyTorch CUDA: NOT AVAILABLE")
+                print("PyTorch CUDA: NOT AVAILABLE")
         except ImportError:
-            print("[!] PyTorch: NOT INSTALLED")
+            print("PyTorch: NOT INSTALLED")
         except Exception as e:
             print(f"[!] PyTorch Error: {e}")
 
@@ -191,11 +207,11 @@ class GPUInfo:
         try:
             import cupy as cp
             self.cupy_available = True
-            print(f"[✓] CuPy: AVAILABLE")
+            print("CuPy: AVAILABLE")
         except ImportError:
-            print(f"[!] CuPy: NOT INSTALLED")
+            print("CuPy: NOT INSTALLED")
         except Exception as e:
-            print(f"[!] CuPy: ERROR - {e}")
+            print(f"CuPy: ERROR - {e}")
 
     def _print_summary(self, logger):
         """Print GPU detection summary."""
