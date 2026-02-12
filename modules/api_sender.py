@@ -14,7 +14,7 @@ import urllib3
 # Disable SSL warnings for development
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-HTTP_PREFIX = "http://"
+HTTP_PREFIX = "https://"
 HTTPS_PREFIX = "https://"
 CONTENT_TYPE_JSON = "application/json"
 

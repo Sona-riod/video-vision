@@ -68,7 +68,7 @@ from kivymd.theming import ThemableBehavior
 from modules.camera import CameraManager
 from modules.database import DatabaseManager
 from modules.api_sender import APISender
-from modules.process_worker import submit_batch
+from modules.process_worker import submit_batch, shutdown
 from modules.utils import setup_logging, create_timestamp, save_last_batch, load_last_batch
 
 # Lazy import QRDetector to avoid torch/torchvision issues at startup
@@ -951,8 +951,20 @@ class SimpleKegApp(MDApp):
         return SimpleKegHMI()
         
     def on_stop(self):
-        if hasattr(self, 'root') and self.root and hasattr(self.root, 'camera'):
-            if self.root.camera: self.root.camera.stop()
+        # Shutdown Process Worker (background threads)
+        try:
+            shutdown()
+        except Exception as e:
+            print(f"Error shutting down worker: {e}")
+
+        if hasattr(self, 'root') and self.root:
+            # Shutdown Camera
+            if hasattr(self.root, 'camera') and self.root.camera:
+                self.root.camera.stop()
+            
+            # Shutdown API Sender (UI instance)
+            if hasattr(self.root, 'api_sender') and self.root.api_sender:
+                self.root.api_sender.close()
 
 if __name__ == '__main__':
     SimpleKegApp().run()

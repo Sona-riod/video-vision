@@ -35,7 +35,11 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
 
         qr_strings, std_dets, method, adv_used, adv_found = _run_detection(frame, frame_path, required_count, session_id)
         
-        filling_date = datetime.now().isoformat()
+        if not filling_date:
+            effective_filling_date = datetime.now().isoformat()
+        else:
+            effective_filling_date = filling_date
+            
         keg_types = [db.get_keg_type(qr_data) for qr_data in qr_strings]
         
         already = _check_and_log_duplicates(qr_strings, required_count, session_id)
@@ -49,7 +53,7 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
             
         db.mark_pallet_processed(qr_strings, session_id, required_count)
         
-        payload, qr_list_db, ts_db = _prepare_api_payload(session_id, decoded_cnt, required_count, batch, beer_type, filling_date, qr_strings)
+        payload, qr_list_db, ts_db = _prepare_api_payload(session_id, decoded_cnt, required_count, batch, beer_type, effective_filling_date, qr_strings)
         
         api_success = False
         if payload:
