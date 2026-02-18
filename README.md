@@ -63,6 +63,15 @@ python main.py
 
 This launches the camera, detection pipeline, operator HMI, and cloud synchronization.
 
+### One-Click Execution
+
+**Linux (Jetson):**
+Run the shell script:
+```bash
+./Start_palletization.sh
+```
+(Ensure it is executable with `chmod +x Start_palletization.sh` first)
+
 ## Version
 
 * Version: 2.0.0

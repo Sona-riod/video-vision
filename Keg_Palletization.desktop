@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Keg Palletization
+Comment=Start the QR Code Palletization System
+# Absolute path to the script you just created
+Exec=/home/icam-540/Documents/Optimised_code_corrected/palletization_final/Start_palletization.sh
+# Directory where the app runs
+Path=/home/icam-540/Documents/Optimised_code_corrected/palletization_final/
+# Icon can be generic or specific path
+Icon=utilities-terminal
+Terminal=true
+Categories=Utility;Application;
