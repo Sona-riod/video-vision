@@ -44,7 +44,7 @@ def _process_one(frame_path: str, image_name: str, session_id: str,
         
         already = _check_and_log_duplicates(qr_strings, required_count, session_id)
         
-        new_global, decoded_cnt = db.store_qr_codes(session_id, qr_strings, method, std_dets, keg_types)
+        _, decoded_cnt = db.store_qr_codes(session_id, qr_strings, method, std_dets, keg_types)
         
         _check_batch_miss(decoded_cnt, required_count, session_id)
         
@@ -369,7 +369,7 @@ def retry_failed_batch(session_id: str) -> bool:
     """Retry a failed batch"""
     try:
         # Get session data
-        qr_list, timestamp = db.get_session_data(session_id)
+        qr_list, _ = db.get_session_data(session_id)
         if not qr_list:
             log.error(f"[{session_id}] No QR data found for retry")
             return False

@@ -7,7 +7,7 @@ import sys
 # --- CONFIGURATION FOR FULL SCREEN HMI ---
 # Must be done before other Kivy imports
 from kivy.config import Config
-# Config.set('graphics', 'fullscreen', 'auto') # Force full screen
+
 # Config.set('graphics', 'show_cursor', '1')   # Show mouse cursor (set to '0' for touch-only)
 Config.write()
 # -----------------------------------------
@@ -88,7 +88,7 @@ def get_qr_detector_class():
             class DummyQRDetector:
                 def __init__(self):
                     print("[WARNING] Using dummy QR detector - no detection will occur")
-                def detect_and_decode(self, frame):
+                def detect_and_decode(self, *args):
                     return [], 0
             _QRDetector = DummyQRDetector
     return _QRDetector
@@ -149,8 +149,8 @@ class SimpleKegHMI(MDBoxLayout):
         self.database = DatabaseManager()
         self.api_sender = APISender()
         # Initialize QR Detector (lazy loaded)
-        QRDetectorClass = get_qr_detector_class()
-        self.qr_detector = QRDetectorClass()
+        qr_detector_class = get_qr_detector_class()
+        self.qr_detector = qr_detector_class()
         
         # Async Detection Setup
         self.detector_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LiveDetector")
@@ -413,7 +413,6 @@ class SimpleKegHMI(MDBoxLayout):
         )
         
         sync_btn = MDIconButton(icon="sync", on_press=lambda x: self.sync_cloud())
-        # logs_btn = MDIconButton(icon="text-box-outline", on_press=self.show_logs) # Removed
         exit_btn = MDIconButton(icon="power", theme_text_color="Error", on_press=self.confirm_exit)
         
         footer_actions.add_widget(sync_btn)
@@ -868,7 +867,7 @@ class SimpleKegHMI(MDBoxLayout):
                         data = response.json()
                         keg_type = data.get("keg_type", "30L")
                         count = data.get("keg_count", DEFAULT_KEG_COUNT)
-                        Clock.schedule_once(lambda dt: self._apply_sync_success(count, keg_type))
+                        Clock.schedule_once(lambda dt, count=count, keg_type=keg_type: self._apply_sync_success(count, keg_type))
                         success = True
                         break
                 except Exception:
