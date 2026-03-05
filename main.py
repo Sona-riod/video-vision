@@ -577,7 +577,6 @@ class SimpleKegHMI(MDBoxLayout):
 
     # --- EXISTING LOGIC HANDLERS (Simplified for brevity but kept functional) ---
     def update_frame(self, dt):
-        frame_start = time.perf_counter()
         if not self.detection_active or not self.camera:
             return
 
@@ -709,7 +708,7 @@ class SimpleKegHMI(MDBoxLayout):
         # Fake Deep Scan (async)
         def deep_scan():
             time.sleep(0.5) # Simulate processing
-            results, count = self.latest_qr_results, len(self.latest_qr_results)
+            _, count = self.latest_qr_results, len(self.latest_qr_results)
             session_id = f"BATCH_{self.database.get_next_batch_number():04d}"
             
             Clock.schedule_once(lambda dt: self._finalize_capture(
@@ -765,8 +764,8 @@ class SimpleKegHMI(MDBoxLayout):
             self.show_toast(f"Pallet {pallet_id} Created!", "success")
             self.add_log(f"SUCCESS: Pallet {pallet_id} Created")
         else:
-            self.show_toast(f"Batch Sent!", "success")
-            self.add_log(f"SUCCESS: Batch Sent")
+            self.show_toast("Batch Sent!", "success")
+            self.add_log("SUCCESS: Batch Sent")
             
         # Reset UI and Detection State
         self.clear_all_qr_codes()
