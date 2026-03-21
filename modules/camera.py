@@ -192,49 +192,55 @@ class CameraManager:
                 self._reconnect_camera()
                 continue
             
-            try:
-                start = time.perf_counter()
-                ret, frame = self.cap.read()
-                
-                # Auto-loop for video files
-                if not ret and self.config.get('type') == 'file':
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = self.cap.read()
-
-                # Retry logic
-                if not ret and self.config.get('type') != 'file':
-                    consecutive_failures += 1
-                    if consecutive_failures > 5:
-                        logger.warning("[CAMERA] Multiple read failures. Reinitializing...")
-                        self._reconnect_camera()
-                        consecutive_failures = 0
-                        continue
-                else:
-                    consecutive_failures = 0
-                    
-                capture_time = (time.perf_counter() - start) * 1000
-                
-                # Update shared frame with lock
-                with self._frame_lock:
-                    self._latest_ret = ret
-                    self._latest_frame = frame
-                
-                # Update FPS counter
-                self._frame_count += 1
-                now = time.time()
-                elapsed = now - self._last_fps_time
-                if elapsed >= 1.0:
-                    self._current_fps = self._frame_count / elapsed
-                    self._frame_count = 0
-                    self._last_fps_time = now
-                    logger.debug(f"Camera FPS: {self._current_fps:.1f}, capture time: {capture_time:.1f}ms")
-                    
-            except Exception as e:
-                logger.error(f"Capture error: {e}")
-                time.sleep(0.5)
-                self._reconnect_camera()
+            consecutive_failures = self._process_capture_step(consecutive_failures)
         
         logger.info("[CAMERA] Capture loop stopped")
+
+    def _process_capture_step(self, consecutive_failures):
+        """Extracts the capture logic from the loop to reduce cognitive complexity."""
+        try:
+            start = time.perf_counter()
+            ret, frame = self.cap.read()
+            
+            # Auto-loop for video files
+            if not ret and self.config.get('type') == 'file':
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+
+            # Retry logic
+            if not ret and self.config.get('type') != 'file':
+                consecutive_failures += 1
+                if consecutive_failures > 5:
+                    logger.warning("[CAMERA] Multiple read failures. Reinitializing...")
+                    self._reconnect_camera()
+                    return 0
+            else:
+                consecutive_failures = 0
+                
+            capture_time = (time.perf_counter() - start) * 1000
+            
+            # Update shared frame with lock
+            with self._frame_lock:
+                self._latest_ret = ret
+                self._latest_frame = frame
+            
+            # Update FPS counter
+            self._frame_count += 1
+            now = time.time()
+            elapsed = now - self._last_fps_time
+            if elapsed >= 1.0:
+                self._current_fps = self._frame_count / elapsed
+                self._frame_count = 0
+                self._last_fps_time = now
+                logger.debug(f"Camera FPS: {self._current_fps:.1f}, capture time: {capture_time:.1f}ms")
+                
+            return consecutive_failures
+            
+        except Exception as e:
+            logger.error(f"Capture error: {e}")
+            time.sleep(0.5)
+            self._reconnect_camera()
+            return consecutive_failures
 
     def get_frame(self):
         """

@@ -139,6 +139,8 @@ from modules.theme import C
 def _c(key):          return C[key]
 def _hex(r,g,b,a=1):  return (r, g, b, a)
 
+WAITING_FOR_KEGS_TEXT = 'Waiting for kegs...'
+PLACE_KEGS_TEXT = 'Place kegs under camera'
 
 # -------------------------------------------------------------
 #  HELPER WIDGETS
@@ -800,7 +802,7 @@ class SimpleKegHMI(MDBoxLayout):
 
         status_texts = MDBoxLayout(orientation='vertical', spacing=0)
         self.process_status_label = MDLabel(
-            text='Waiting for kegs...',
+            text=WAITING_FOR_KEGS_TEXT,
             font_style='Subtitle2',
             theme_text_color='Custom',
             text_color=C['text1'],
@@ -809,7 +811,7 @@ class SimpleKegHMI(MDBoxLayout):
         )
         self.process_status_label.bind(size=self.process_status_label.setter('text_size'))
         self.process_detail_label = MDLabel(
-            text='Place kegs under camera',
+            text=PLACE_KEGS_TEXT,
             font_style='Caption',
             theme_text_color='Custom',
             text_color=C['text2'],
@@ -1390,7 +1392,7 @@ class SimpleKegHMI(MDBoxLayout):
             self._set_status('', f'Detecting. {qr_count} of {self.required_keg_count}',
                              'Keep kegs in frame', 'Detecting', C['accent'])
         else:
-            self._set_status('', 'Waiting for kegs...', 'Place kegs under camera',
+            self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                              'Scanning...', C['accent'])
 
     def update_status(self, text, color_theme):
@@ -1607,7 +1609,7 @@ class SimpleKegHMI(MDBoxLayout):
         self.data_ready_to_send   = False
         self.send_btn.disabled    = True
         self.send_btn.set_preset('dim')
-        self._set_status('', 'Waiting for kegs...', 'Place kegs under camera',
+        self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                          'Scanning...', C['accent'])
 
         if self.is_auto_mode:
