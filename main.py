@@ -139,8 +139,6 @@ from modules.theme import C
 def _c(key):          return C[key]
 def _hex(r,g,b,a=1):  return (r, g, b, a)
 
-WAITING_FOR_KEGS_TEXT = 'Waiting for kegs...'
-PLACE_KEGS_TEXT = 'Place kegs under camera'
 
 # -------------------------------------------------------------
 #  HELPER WIDGETS
@@ -802,7 +800,7 @@ class SimpleKegHMI(MDBoxLayout):
 
         status_texts = MDBoxLayout(orientation='vertical', spacing=0)
         self.process_status_label = MDLabel(
-            text=WAITING_FOR_KEGS_TEXT,
+            text='Waiting for kegs...',
             font_style='Subtitle2',
             theme_text_color='Custom',
             text_color=C['text1'],
@@ -811,7 +809,7 @@ class SimpleKegHMI(MDBoxLayout):
         )
         self.process_status_label.bind(size=self.process_status_label.setter('text_size'))
         self.process_detail_label = MDLabel(
-            text=PLACE_KEGS_TEXT,
+            text='Place kegs under camera',
             font_style='Caption',
             theme_text_color='Custom',
             text_color=C['text2'],
@@ -1142,6 +1140,8 @@ class SimpleKegHMI(MDBoxLayout):
         self.update_qr_list_display()
         self.current_count = 0
         self.add_log("QR list cleared")
+        if hasattr(self, 'last_captured_qr_set'):
+            self.last_captured_qr_set = set()
 
     def update_qr_list_display(self):
         self.qr_list_layout.clear_widgets()
@@ -1355,9 +1355,28 @@ class SimpleKegHMI(MDBoxLayout):
         if not (self.is_auto_mode and not self.processing
                 and not self.auto_confirm_pending):
             return
+            
+        # FIX 1: Do not auto-capture if there's already a batch waiting to be sent
+        if self.data_ready_to_send:
+            return
+            
+        # Extract QR strings
+        current_qrs = set()
+        for qr in qr_list:
+            if isinstance(qr, dict) and 'data' in qr:
+                current_qrs.add(qr['data'])
+            elif isinstance(qr, str):
+                current_qrs.add(qr)
+                
+        # FIX 2: Do not auto-capture if this exact set of QRs was the last one captured
+        if current_qrs and getattr(self, 'last_captured_qr_set', set()) == current_qrs:
+            self.stability_counter = 0
+            return
+
         if len(qr_list) == self.required_keg_count:
             self.stability_counter += 1
             if self.stability_counter >= STABILITY_THRESHOLD:
+                self.last_captured_qr_set = current_qrs
                 self.trigger_capture(frame)
                 self.stability_counter = 0
         else:
@@ -1392,7 +1411,7 @@ class SimpleKegHMI(MDBoxLayout):
             self._set_status('', f'Detecting. {qr_count} of {self.required_keg_count}',
                              'Keep kegs in frame', 'Detecting', C['accent'])
         else:
-            self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
+            self._set_status('', 'Waiting for kegs...', 'Place kegs under camera',
                              'Scanning...', C['accent'])
 
     def update_status(self, text, color_theme):
@@ -1609,7 +1628,7 @@ class SimpleKegHMI(MDBoxLayout):
         self.data_ready_to_send   = False
         self.send_btn.disabled    = True
         self.send_btn.set_preset('dim')
-        self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
+        self._set_status('', 'Waiting for kegs...', 'Place kegs under camera',
                          'Scanning...', C['accent'])
 
         if self.is_auto_mode:

@@ -27,7 +27,12 @@ class ZebraPrinter:
         
         # Using the exact ZPL from your successful terminal test
         # ^BQN,2,15 = QR code scale 15. ^A0N,40,40 = Text font.
-        zpl_command = f"^XA^FO50,50^BQN,2,15^FDQA,{pallet_id}^FS^FO50,320^A0N,40,40^FDPallet: {pallet_id}^FS^XZ"
+        zpl_command = f"""
+^XA
+^FO50,50^BQN,2,15^FDQA,{pallet_id}^FS
+^FO50,320^A0N,40,40^FDPallet: {pallet_id}^FS
+^XZ
+"""
         
         if self.use_pyusb:
             return self._print_via_pyusb(zpl_command)
@@ -91,6 +96,7 @@ class ZebraPrinter:
                 return False, "Endpoint not found"
                 
             ep.write(zpl_command.encode('utf-8'))
+            usb.util.dispose_resources(dev)
             logger.info("Successfully printed using PyUSB fallback.")
             return True, ""
             
