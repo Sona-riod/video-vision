@@ -6,9 +6,8 @@ import os
 import shutil
 import time
 from datetime import datetime
-import re 
-from pathlib import Path  
 import re
+from pathlib import Path
 
 CONFIG_FILENAME = "config.py"
 

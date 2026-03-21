@@ -9,15 +9,27 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 from typing import List, Dict, Any
 import cv2
-from modules.detector import detect_qr_standard, detect_qr_advanced
+from modules.detector import detect_qr_standard
+from modules.advanced import run_advanced_detection
 from modules.database import DatabaseManager
 from modules.api_sender import APISender
-from config import CAMERA_MAC_ID
+from config import CAMERA_MAC_ID, PROCESS_WORKERS, SHUTDOWN_TIMEOUT, DB_TIMEOUT
 
 log = logging.getLogger(__name__)
 db = DatabaseManager()
 api_sender = APISender()
-executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ProcessWorker")
+executor = ThreadPoolExecutor(max_workers=PROCESS_WORKERS, thread_name_prefix="ProcessWorker")
+
+def notify_ui(message, msg_type="info", duration=3):
+    """Safely notify the Kivy MD UI from a background thread."""
+    try:
+        from kivy.clock import Clock
+        from kivymd.app import MDApp
+        app = MDApp.get_running_app()
+        if app and hasattr(app, 'hmi'):
+            Clock.schedule_once(lambda dt: app.hmi.show_toast(message, msg_type, duration))
+    except Exception as e:
+        log.warning(f"Could not notify UI: {e}")
 
 def _process_one(frame_path: str, image_name: str, session_id: str, 
                  required_count: int, composition=None, beer_type="", 
@@ -104,14 +116,31 @@ def _run_detection(frame, frame_path, required_count, session_id):
     
     if len(std_qrs) < required_count:
         print(f"\n[PROCESS] Standard detection found {len(std_qrs)}/{required_count} QRs - Triggering ADVANCED DETECTION...")
-        log.info(f"[{session_id}] Standard → {len(std_qrs)} QR(s), using advanced detection")
+        log.info(f"[{session_id}] Standard -> {len(std_qrs)} QR(s), using advanced detection")
+        notify_ui("Running Advanced Detection (Deep Scan)...", "info", 4)
         try:
-            std_qrs, adv_found = detect_qr_advanced(frame_path)
+            adv_qr_strings = run_advanced_detection(frame_path)
+            # Combine standard QRs with advanced detection QRs to ensure none are missed
+            std_strings = [qr['data'] if isinstance(qr, dict) else qr for qr in std_qrs]
+            combined_qrs = set(std_strings)
+            for qr in adv_qr_strings:
+                combined_qrs.add(qr)
+            
+            # Form final list
+            std_qrs = list(combined_qrs)
+            adv_found = len(combined_qrs)
+            
             print(f"[PROCESS] Standard + Advanced Combined: {adv_found} QRs")
             method = "advanced"
             adv_used = 1
             std_dets = adv_found
             log.info(f"[{session_id}] Advanced detection found {adv_found} QR(s)")
+            
+            if adv_found >= required_count:
+                notify_ui(f"Advanced Mode: Target Achieved ({adv_found}/{required_count})!", "success", 4)
+            else:
+                notify_ui(f"Advanced Mode: Missed Target ({adv_found}/{required_count}).", "warning", 5)
+                
         except Exception as e:
             error_msg = f"Advanced detection failed: {str(e)}"
             log.error(f"[{session_id}] {error_msg}")
@@ -119,6 +148,7 @@ def _run_detection(frame, frame_path, required_count, session_id):
                                  require_attention=True,
                                  attention_reason="Advanced detection error")
             db.mark_for_attention(session_id, "Advanced detection error")
+            notify_ui(f"Advanced Mode Error: {str(e)[:50]}", "error", 4)
     
     qr_strings = [qr['data'] if isinstance(qr, dict) else qr for qr in std_qrs]
     print(f"  -> QR Strings for DB: {qr_strings}")
@@ -350,7 +380,10 @@ def shutdown():
     api_sender.stop_retry_monitor()
     
     # Shutdown executor
-    executor.shutdown(wait=True, timeout=30)
+    try:
+        executor.shutdown(wait=True)
+    except Exception as e:
+        log.error(f"Error shutting down executor: {e}")
     
     # Close API sender
     api_sender.close()
@@ -375,7 +408,7 @@ def retry_failed_batch(session_id: str) -> bool:
             return False
         
         # Get batch info from database
-        conn = sqlite3.connect(db.db_path, timeout=60)
+        conn = sqlite3.connect(db.db_path, timeout=DB_TIMEOUT)
         cur = conn.cursor()
         cur.execute('''
             SELECT beer_type, batch, filling_date, target_keg_count
@@ -432,7 +465,7 @@ def get_batch_status(session_id: str) -> Dict[str, Any]:
         qr_list, timestamp = db.get_session_data(session_id)
         
         # Get detailed info from database
-        conn = sqlite3.connect(db.db_path, timeout=60)
+        conn = sqlite3.connect(db.db_path, timeout=DB_TIMEOUT)
         cur = conn.cursor()
         cur.execute('''
             SELECT batch_status, require_attention, attention_reason,

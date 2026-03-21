@@ -9,7 +9,7 @@ from pyzbar.pyzbar import ZBarSymbol
 from qreader import QReader
 import shutil
 import logging
-from config import QR_MODEL_PATH, TILE_SIZE, OVERLAP_RATIO, SCALE_FACTORS, MIN_CROP_SIZE, MIN_UPSCALE_SIZE
+from config import QR_MODEL_PATH, TILE_SIZE, OVERLAP_RATIO, SCALE_FACTORS, MIN_CROP_SIZE, MIN_UPSCALE_SIZE, ADV_YOLO_CONF, ADV_YOLO_IOU, QREADER_MODEL_SIZE, QR_CONF_THRESHOLD
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class AdvancedQRDetector:
     def __init__(self, model_path=None):
         self.model_path = model_path or str(QR_MODEL_PATH)
-        self.qreader = QReader(model_size='s', min_confidence=0.5)  
+        self.qreader = QReader(model_size=QREADER_MODEL_SIZE, min_confidence=QR_CONF_THRESHOLD)
         self.slice_width, self.slice_height = TILE_SIZE
         self.overlap_width_ratio = OVERLAP_RATIO
         self.overlap_height_ratio = OVERLAP_RATIO
@@ -170,7 +170,7 @@ class AdvancedQRDetector:
         if image is None:
             raise FileNotFoundError(f"Advanced: Image not found: {image_path}")
 
-        results = model.predict(image, conf=0.3, iou=0.5, verbose=False)
+        results = model.predict(image, conf=ADV_YOLO_CONF, iou=ADV_YOLO_IOU, verbose=False)
         os.makedirs(output_dir, exist_ok=True)
 
         cropped_paths = []
