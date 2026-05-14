@@ -5,7 +5,7 @@ import json
 import hashlib
 from typing import List, Optional
 from datetime import datetime
-from config import DB_PATH, PALLET_STATUS, DB_TIMEOUT
+from config import DB_PATH, PALLET_STATUS
 
 class PalletController:
     def __init__(self):
@@ -69,11 +69,11 @@ class PalletController:
         }
     
     def update_pallet_status(self, pallet_id: str, new_status: str) -> dict:
-        """Update pallet status (CREATED -> SHIPPED -> etc.)"""
+        """Update pallet status (CREATED → SHIPPED → etc.)"""
         if new_status not in PALLET_STATUS:
             return {'success': False, 'error': 'INVALID_STATUS'}
         
-        conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+        conn = sqlite3.connect(self.db_path, timeout=60)
         cur = conn.cursor()
         
         if new_status == 'SHIPPED':
@@ -96,7 +96,7 @@ class PalletController:
     
     def get_pallet_info(self, pallet_id: str) -> dict:
         """Get detailed pallet information"""
-        conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+        conn = sqlite3.connect(self.db_path, timeout=60)
         cur = conn.cursor()
         
         cur.execute('''

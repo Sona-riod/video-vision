@@ -22,40 +22,45 @@ class ZebraPrinter:
         if not pallet_id:
             logger.warning("No pallet ID provided for printing.")
             return False, "No pallet ID provided"
-            
+
         logger.info(f"Generating ZPL for Pallet ID: {pallet_id}")
-        
-        # Using the exact ZPL from your successful terminal test
-        # ^BQN,2,15 = QR code scale 15. ^A0N,40,40 = Text font.
-        zpl_command = f"""
-^XA
-^FO50,50^BQN,2,15^FDQA,{pallet_id}^FS
-^FO50,320^A0N,40,40^FDPallet: {pallet_id}^FS
-^XZ
-"""
-        
+
+        # Clean ZPL command (no leading/trailing whitespace)
+        # ^BQN,2,25: N=Normal, 2=Model 2, 25=Magnification (Extra Large QR)
+        # ^FO50,1000: Positioned lower to ensure no overlap even with extra large 25x QR codes
+        zpl_command = (
+            "^XA\n"
+            f"^FO50,50^BQN,2,25^FDQA,{pallet_id}^FS\n"
+            f"^FO50,1000^A0N,60,60^FDPallet: {pallet_id}^FS\n"
+            "^XZ"
+        )
+
         if self.use_pyusb:
             return self._print_via_pyusb(zpl_command)
-        
+
         try:
-            # Method 1: Try direct write (Works if user is added to 'lp' group)
+            # Method 1: Direct write (works if user is in 'lp' group)
             with open(self.device_path, 'wb') as printer:
                 printer.write(zpl_command.encode('utf-8'))
             logger.info("Successfully printed directly to USB.")
             return True, ""
-            
+
         except PermissionError:
-            # Method 2: Fallback to the sudo tee method you verified in terminal
+            # Method 2: Fallback to sudo tee
             logger.warning(f"Permission denied for {self.device_path}. Falling back to sudo tee.")
             try:
-                cmd = f'echo "{zpl_command}" | sudo tee {self.device_path} > /dev/null'
-                subprocess.run(cmd, shell=True, check=True)
+                subprocess.run(
+                    ['sudo', 'tee', self.device_path],
+                    input=zpl_command.encode('utf-8'),
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
                 logger.info("Successfully printed using sudo tee fallback.")
                 return True, ""
             except Exception as e:
                 logger.error(f"Fallback printing failed: {e}")
                 return False, f"Fallback printing failed: {e}"
-                
+
         except Exception as e:
             logger.error(f"Printer error: {e}")
             return False, str(e)
@@ -64,47 +69,107 @@ class ZebraPrinter:
         try:
             import usb.core
             import usb.util
-            
-            # Find Zebra printer by vendor ID (0x0a5f)
-            dev = usb.core.find(idVendor=0x0a5f)
-            if dev is None:
-                logger.error("No Zebra printer found via PyUSB.")
-                return False, "No printer found via PyUSB"
-                
-            # Detach kernel driver if active
-            if dev.is_kernel_driver_active(0):
-                try:
-                    dev.detach_kernel_driver(0)
-                except usb.core.USBError as e:
-                    logger.warning(f"Could not detach kernel driver: {e}")
-                    
-            try:
-                dev.set_configuration()
-            except usb.core.USBError as e:
-                logger.warning(f"Could not set configuration: {e}")
-                
-            cfg = dev.get_active_configuration()
-            intf = cfg[(0,0)]
-            
-            ep = usb.util.find_descriptor(
-                intf,
-                custom_match = lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-            )
-            
-            if ep is None:
-                logger.error("Endpoint not found via PyUSB.")
-                return False, "Endpoint not found"
-                
-            ep.write(zpl_command.encode('utf-8'))
-            usb.util.dispose_resources(dev)
-            logger.info("Successfully printed using PyUSB fallback.")
-            return True, ""
-            
         except ImportError:
             logger.error("PyUSB not installed. Cannot use USB fallback. Please run: pip install pyusb")
             return False, "PyUSB not installed"
+
+        dev = usb.core.find(idVendor=0x0a5f)
+        if dev is None:
+            logger.error("No Zebra printer found via PyUSB.")
+            return False, "No printer found via PyUSB"
+
+        return self._write_to_usb_device(dev, zpl_command)
+
+    def _write_to_usb_device(self, dev, zpl_command, _retry=True):
+        """Write ZPL to USB device, retrying once with a full reset on [Errno 5]."""
+        import usb.core
+        import usb.util
+
+        interface_claimed = False
+        detached_ifaces = []
+
+        try:
+            # 1. Reset device to clear any stale USB state
+            try:
+                dev.reset()
+            except Exception as e:
+                logger.warning(f"Device reset warning (non-fatal): {e}")
+
+            # 2. Detach kernel driver (usblp) and track which interfaces were detached
+            for iface_num in range(dev.get_active_configuration().bNumInterfaces):
+                try:
+                    if dev.is_kernel_driver_active(iface_num):
+                        dev.detach_kernel_driver(iface_num)
+                        detached_ifaces.append(iface_num)
+                        logger.debug(f"Detached kernel driver from interface {iface_num}")
+                except Exception as e:
+                    logger.warning(f"Could not detach kernel driver from interface {iface_num}: {e}")
+
+            try:
+                dev.set_configuration()
+            except Exception as e:
+                logger.warning(f"set_configuration warning (non-fatal): {e}")
+
+            cfg = dev.get_active_configuration()
+            intf = cfg[(0, 0)]
+
+            # 3. Claim the interface
+            usb.util.claim_interface(dev, intf.bInterfaceNumber)
+            interface_claimed = True
+
+            ep = usb.util.find_descriptor(
+                intf,
+                custom_match=lambda e: (
+                    usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+                ),
+            )
+
+            if ep is None:
+                logger.error("Endpoint not found via PyUSB.")
+                return False, "Endpoint not found"
+
+            # 4. Send ZPL
+            ep.write(zpl_command.encode('utf-8'), timeout=5000)
+            logger.info("Successfully printed using PyUSB.")
+            return True, ""
+
         except Exception as e:
+            err_str = str(e)
             logger.error(f"PyUSB printing failed: {e}")
-            if "Access denied" in str(e) or "Insufficient permissions" in str(e):
-                logger.error("Try running the app with 'sudo' or setting udev rules for the printer.")
+
+            if "[Errno 5]" in err_str and _retry:
+                # Hard reset and retry once on I/O error
+                logger.warning("Got [Errno 5] I/O error — resetting device and retrying once...")
+                try:
+                    dev.reset()
+                except Exception:
+                    pass
+                return self._write_to_usb_device(dev, zpl_command, _retry=False)
+
+            if "Access denied" in err_str or "Insufficient permissions" in err_str:
+                logger.error("Try running the app with 'sudo' or add a udev rule for the printer.")
+
             return False, f"PyUSB failed: {e}"
+
+        finally:
+            # 5. Release interface claim
+            if interface_claimed:
+                try:
+                    cfg = dev.get_active_configuration()
+                    intf = cfg[(0, 0)]
+                    usb.util.release_interface(dev, intf.bInterfaceNumber)
+                    logger.debug("Interface released.")
+                except Exception:
+                    pass
+
+            # 6. Re-attach kernel driver — return printer to OS
+            for iface_num in detached_ifaces:
+                try:
+                    dev.attach_kernel_driver(iface_num)
+                    logger.debug(f"Re-attached kernel driver to interface {iface_num}")
+                except Exception as e:
+                    logger.warning(f"Could not re-attach kernel driver to interface {iface_num}: {e}")
+
+            # 7. Free all PyUSB resources
+            usb.util.dispose_resources(dev)
+            logger.debug("USB resources disposed — printer closed.")

@@ -65,16 +65,10 @@ except ImportError as e:
 
 # Import config
 try:
-    from config import QR_MODEL_PATH, QR_CONF_THRESHOLD, QR_CROP_PADDING, QR_MIN_CROP_SIZE, QR_UPSCALE_FACTOR, QREADER_MODEL_SIZE, DETECTOR_WORKERS
+    from config import QR_MODEL_PATH
 except ImportError:
     from pathlib import Path
     QR_MODEL_PATH = Path(__file__).parent.parent / "models" / "model_qr" / "best.pt"
-    QR_CONF_THRESHOLD = 0.5
-    QR_CROP_PADDING = 15
-    QR_MIN_CROP_SIZE = 100
-    QR_UPSCALE_FACTOR = 2
-    QREADER_MODEL_SIZE = 's'
-    DETECTOR_WORKERS = 2
 
 print("="*60)
 print(f"DETECTOR STATUS:")
@@ -115,7 +109,7 @@ class QRDetector:
         self.cv_detector = cv2.QRCodeDetector()
         
         # Threading for async detection
-        self._executor = ThreadPoolExecutor(max_workers=DETECTOR_WORKERS, thread_name_prefix="QRDetect")
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="QRDetect")
         self._lock = threading.Lock()
         self._last_results = []
         self._detection_running = False
@@ -130,10 +124,10 @@ class QRDetector:
         self._total_time = 0
         
         # Configuration
-        self.crop_padding = QR_CROP_PADDING
-        self.min_crop_size = QR_MIN_CROP_SIZE
-        self.upscale_factor = QR_UPSCALE_FACTOR
-        self.confidence_threshold = QR_CONF_THRESHOLD
+        self.crop_padding = 15  # Pixels to add around detected QR
+        self.min_crop_size = 100  # Minimum crop size for upscaling
+        self.upscale_factor = 2  # How much to upscale small crops
+        self.confidence_threshold = 0.5  # YOLO confidence threshold
         
         logger.info(f"QRDetector initialized - YOLO: {self.model is not None}, Pyzbar: {self.pyzbar_available}, QReader: {self.qreader_available}")
     
@@ -146,7 +140,7 @@ class QRDetector:
             try:
                 logger.info("Initializing QReader model (one-time, may take a moment)...")
                 start = time.perf_counter()
-                self.qreader = QReaderClass(model_size=QREADER_MODEL_SIZE, min_confidence=QR_CONF_THRESHOLD)
+                self.qreader = QReaderClass(model_size='s', min_confidence=0.5)
                 elapsed = (time.perf_counter() - start) * 1000
                 logger.info(f"QReader initialized in {elapsed:.0f}ms")
             except Exception as e:
@@ -447,28 +441,28 @@ class QRDetector:
         }
 
     def shutdown(self):
-        """Cleanup resources."""
+        """Cleanup resources and free GPU memory."""
         logger.info("Shutting down QRDetector")
         self._executor.shutdown(wait=False)
+        if self.model is not None:
+            del self.model
+            self.model = None
+        if self.qreader is not None:
+            del self.qreader
+            self.qreader = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("CUDA cache cleared")
+        except Exception:
+            pass
 
-
-# Module-level singleton detector (avoids reloading YOLO model per call)
-_shared_detector = None
-_shared_detector_lock = threading.Lock()
-
-def _get_shared_detector():
-    """Get or create the shared QRDetector singleton."""
-    global _shared_detector
-    if _shared_detector is None:
-        with _shared_detector_lock:
-            if _shared_detector is None:
-                _shared_detector = QRDetector()
-    return _shared_detector
 
 # Convenience functions (kept for compatibility)
 def detect_qr_standard(frame, use_qreader=False):
     """Detect QR codes in full frame."""
-    detector = _get_shared_detector()
+    detector = QRDetector()
     return detector.detect_and_decode(frame, use_qreader=use_qreader)
 
 
@@ -488,7 +482,7 @@ def detect_qr_advanced(image_path):
             
         print(f"[ADVANCED] Image loaded successfully: {frame.shape}")
         
-        detector = _get_shared_detector()
+        detector = QRDetector()
         results, count = detector.detect_and_decode(frame)
         
         print(f"[ADVANCED] Detection finished. Total QRs found: {count}")

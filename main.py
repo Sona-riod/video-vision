@@ -75,12 +75,14 @@ from kivymd.theming import ThemableBehavior
 from modules.camera import CameraManager
 from modules.database import DatabaseManager
 from modules.api_sender import APISender
+import modules.process_worker as process_worker
 from modules.process_worker import submit_batch, shutdown
+from modules.session_store import SessionStore, ScanState
 from modules.utils import setup_logging, create_timestamp, save_last_batch, load_last_batch
 # --- ADDED PRINTER MODULE ---
 from modules.printer import ZebraPrinter  
 
-# -- Lazy QRDetector ------------------------------------------
+
 _QRDetector = None
 
 def get_qr_detector_class():
@@ -374,35 +376,30 @@ class SimpleKegHMI(MDBoxLayout):
         self.qr_detector = None
         self.detector_executor = None
 
-        # QR Tracking & State
-        self.latest_qr_results    = []
-        self.last_captured_qr_set = set()
-        self.captured_qr_codes    = []
-        self.detection_active     = False
-        self.required_keg_count   = DEFAULT_KEG_COUNT
-        self.current_count        = 0
-        self.prev_count           = 0
-        self.stability_counter    = 0
-        self.is_auto_mode         = True
-        self.processing           = False
-        self.auto_confirm_pending = False
-        self.auto_pending_frame   = None
-        self.auto_capture_cooldown= False
-        self.beer_types           = ["Loading..."]
-        self.beer_type_map        = {}
-        self.menu_beer            = None
-        self.confirm_dialog       = None
-        self.count_dialog         = None
-        self.last_batch_number    = load_last_batch()
+        # ── In-memory session state machine (replaces 8 scattered flags) ──
+        self.session = SessionStore(target_count=DEFAULT_KEG_COUNT)
+
+        # QR Tracking & Detection
+        self.latest_qr_results  = []
+        self.detection_active   = False
+        self.is_auto_mode       = True
+        self.beer_types         = ["Loading..."]
+        self.beer_type_map      = {}
+        self.menu_beer          = None
+        self.confirm_dialog     = None
+        self.count_dialog       = None
+        self.last_batch_number  = load_last_batch()
 
         # Performance & Preview
-        self._preview_texture   = None
-        self._texture_size      = (0, 0)
-        self.data_ready_to_send = False
-        self._pending_capture   = None
-        self._frame_times       = []
-        self._last_perf_log     = time.time()
-        self._no_detect_secs    = 0
+        self._preview_texture = None
+        self._texture_size    = (0, 0)
+        self._frame_times     = []
+        self._last_perf_log   = time.time()
+        self._no_detect_secs  = 0
+
+        # Keep these for backward compat with display helpers
+        self.required_keg_count = DEFAULT_KEG_COUNT
+        self.current_count      = 0
 
         # Build UI layout (synchronous)
         self.build_ui()
@@ -416,7 +413,8 @@ class SimpleKegHMI(MDBoxLayout):
 
         self.splash.update_status("Initialising Database & API...")
         self.database   = DatabaseManager()
-        self.api_sender = APISender()
+        self.api_sender = APISender()          # single instance — one retry-monitor thread
+        process_worker.set_api_sender(self.api_sender)  # inject; kills dual-singleton bug
         self.printer    = ZebraPrinter()  # --- INITIALIZE PRINTER ---
         
         self.splash.update_status("Loading AI Detection Models...")
@@ -1126,35 +1124,32 @@ class SimpleKegHMI(MDBoxLayout):
     #  QR LIST  (unchanged logic, new widget)
     # --------------------------------------------------------
     def add_qr_to_list(self, qr_data):
-        if qr_data not in self.captured_qr_codes:
-            self.captured_qr_codes.append(qr_data)
+        if self.session.add_qr(qr_data):
             self.update_qr_list_display()
             return True
         return False
 
     def remove_qr_from_list(self, qr_data):
-        if qr_data in self.captured_qr_codes:
-            self.captured_qr_codes.remove(qr_data)
-            self.update_qr_list_display()
-            self.current_count = len(self.captured_qr_codes)
+        self.session.qr_codes.discard(qr_data)
+        self.update_qr_list_display()
+        self.current_count = self.session.count()
 
     def clear_all_qr_codes(self, instance=None):
-        self.captured_qr_codes = []
+        self.session.qr_codes.clear()
         self.update_qr_list_display()
         self.current_count = 0
         self.add_log("QR list cleared")
-        if hasattr(self, 'last_captured_qr_set'):
-            self.last_captured_qr_set = set()
 
     def update_qr_list_display(self):
         self.qr_list_layout.clear_widgets()
-        count = len(self.captured_qr_codes)
+        qr_list = self.session.qr_list()
+        count   = len(qr_list)
         self.qr_count_lbl.text = f'({count})'
 
         if count == 0:
             self.qr_list_layout.add_widget(self.qr_empty_lbl)
         else:
-            for i, qr_data in enumerate(self.captured_qr_codes, 1):
+            for i, qr_data in enumerate(qr_list, 1):
                 item = QRListItem(
                     code=qr_data,
                     index=i,
@@ -1280,7 +1275,8 @@ class SimpleKegHMI(MDBoxLayout):
         if not ret or frame is None:
             return
         vis_frame = frame.copy()
-        if self.processing:
+        # Don't run new detection while sending (SENDING/SENT) — just show live feed
+        if self.session.state in (ScanState.SENDING, ScanState.SENT):
             self._draw_qr_overlays(vis_frame)
             self._update_preview_texture(vis_frame)
             return
@@ -1355,35 +1351,33 @@ class SimpleKegHMI(MDBoxLayout):
         self.warn_banner.opacity = 0
 
     def _check_auto_trigger(self, qr_list, frame):
-        if not (self.is_auto_mode and not self.processing
-                and not self.auto_confirm_pending):
+        # Only auto-capture when actively scanning, not mid-send
+        if not self.is_auto_mode:
             return
-            
-        # FIX 1: Do not auto-capture if there's already a batch waiting to be sent
-        if self.data_ready_to_send:
+        if self.session.state != ScanState.SCANNING:
             return
-            
-        # Extract QR strings
+
+        # Extract QR strings from live detector results
         current_qrs = set()
         for qr in qr_list:
             if isinstance(qr, dict) and 'data' in qr:
                 current_qrs.add(qr['data'])
             elif isinstance(qr, str):
                 current_qrs.add(qr)
-                
-        # FIX 2: Do not auto-capture if this exact set of QRs was the last one captured
-        if current_qrs and getattr(self, 'last_captured_qr_set', set()) == current_qrs:
-            self.stability_counter = 0
+
+        # Do not re-capture the exact same pallet that was just sent
+        if current_qrs and current_qrs == self.session.last_sent_qr_set:
+            self.session.stability_counter = 0
             return
 
-        if len(qr_list) == self.required_keg_count:
-            self.stability_counter += 1
-            if self.stability_counter >= STABILITY_THRESHOLD:
-                self.last_captured_qr_set = current_qrs
+        # Stability check: count must be at target for STABILITY_THRESHOLD frames
+        if self.session.target_reached():
+            self.session.stability_counter += 1
+            if self.session.stability_counter >= STABILITY_THRESHOLD:
+                self.session.stability_counter = 0
                 self.trigger_capture(frame)
-                self.stability_counter = 0
         else:
-            self.stability_counter = 0
+            self.session.stability_counter = 0
 
     def _update_preview_texture(self, frame):
         try:
@@ -1397,22 +1391,29 @@ class SimpleKegHMI(MDBoxLayout):
             pass
 
     def process_frame(self, frame):
-        qr_count = len(self.latest_qr_results)
+        qr_count = self.session.count()
         self.stat_detected.value_label.text  = str(qr_count)
-        self.stat_stability.value_label.text = str(self.stability_counter)
+        self.stat_stability.value_label.text = str(self.session.stability_counter)
 
-        if self.processing:
-            self._set_status('', 'Processing batch...', 'Please wait',
-                             'Processing...', C['orange'])
-        elif self.data_ready_to_send:
+        state = self.session.state
+        if state == ScanState.SENDING:
+            self._set_status('', 'Sending to server...', 'Please wait',
+                             'Sending...', C['orange'])
+        elif state == ScanState.READY:
             self._set_status('', 'Ready to Send!', 'Tap Send to upload',
                              'Ready', C['green'])
+        elif self.session.over_target():
+            over = qr_count - self.required_keg_count
+            self._set_status('', f'OVER TARGET — {qr_count} detected ({over} extra)',
+                             f'Remove {over} keg(s) to match target {self.required_keg_count}',
+                             'Over', C['red'])
         elif qr_count == self.required_keg_count:
             self._set_status('', 'Target Achieved', f'{qr_count} kegs detected',
                              'Target Met', C['green'])
         elif qr_count > 0:
-            self._set_status('', f'Detecting. {qr_count} of {self.required_keg_count}',
-                             'Keep kegs in frame', 'Detecting', C['accent'])
+            remaining = self.required_keg_count - qr_count
+            self._set_status('', f'Detecting — {qr_count} of {self.required_keg_count}',
+                             f'{remaining} more needed', 'Detecting', C['accent'])
         else:
             self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                              'Scanning...', C['accent'])
@@ -1429,7 +1430,8 @@ class SimpleKegHMI(MDBoxLayout):
     # --------------------------------------------------------
     def set_auto_mode(self, instance):
         self.is_auto_mode = True
-        self._no_detect_secs  = 0
+        self._no_detect_secs          = 0
+        self.session.stability_counter = 0
 
         # Toggle button styles — AUTO glows blue, MANUAL goes to dim ghost
         self.auto_btn.set_preset('primary')
@@ -1455,8 +1457,8 @@ class SimpleKegHMI(MDBoxLayout):
         self.add_log("Switched to AUTO")
 
     def set_manual_mode(self, instance, auto_triggered=False):
-        self.is_auto_mode    = False
-        self.stability_counter = 0
+        self.is_auto_mode              = False
+        self.session.stability_counter = 0
 
         # Toggle button styles — MANUAL glows amber, AUTO goes to dim ghost
         self.manual_btn.set_preset('amber')
@@ -1488,7 +1490,7 @@ class SimpleKegHMI(MDBoxLayout):
             self.add_log("Auto-switched to MANUAL (no QR detected)")
 
     # --------------------------------------------------------
-    #  CAPTURE  (unchanged logic)
+    #  CAPTURE
     # --------------------------------------------------------
     def force_capture(self, instance):
         self.show_confirmation_dialog(
@@ -1503,7 +1505,8 @@ class SimpleKegHMI(MDBoxLayout):
             self.trigger_capture(frame)
 
     def trigger_capture(self, frame):
-        if self.processing:
+        # Guard: only capture when actively scanning
+        if self.session.state != ScanState.SCANNING:
             return
 
         batch = self.batch_field.text
@@ -1517,123 +1520,122 @@ class SimpleKegHMI(MDBoxLayout):
             return
 
         beer_id = self.beer_type_map.get(selected_beer_name, selected_beer_name)
-        self.processing = True
-        self._set_status('', 'Capturing...', 'Scanning QR codes deeply',
-                         'Capturing', C['orange'])
 
+        # ── Generate session_id ONCE here (timestamp-based, no DB call = no race) ──
+        session_id = f"BATCH_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Save frame to disk
         image_name = f"batch_{create_timestamp()}.jpg"
         frame_path = str(SAVE_FOLDER / image_name)
         cv2.imwrite(frame_path, frame)
 
-        def deep_scan():
-            time.sleep(0.5)
-            _, count = self.latest_qr_results, len(self.latest_qr_results)
-            session_id = f"BATCH_{self.database.get_next_batch_number():04d}"
-            Clock.schedule_once(lambda dt: self._finalize_capture(
-                frame_path, image_name, session_id,
-                beer_id, selected_beer_name, batch,
-                datetime.now().strftime('%d-%m-%Y %H:%M:%S'), count
-            ))
+        # Populate session store
+        self.session.beer_type     = selected_beer_name
+        self.session.beer_type_id  = beer_id
+        self.session.batch_number  = batch
+        self.session.frame_path    = frame_path
+        self.session.image_name    = image_name
+        self.session.captured_at   = datetime.now()
+        self.session.session_id    = session_id
+        self.session.target_count  = self.required_keg_count
+        self.session.state         = ScanState.READY
 
-        threading.Thread(target=deep_scan, daemon=True).start()
-
-    def _finalize_capture(self, frame_path, image_name, session_id,
-                           beer_id, beer_name, batch, filling_timestamp, final_count):
-        self._pending_capture = {
-            'frame_path': frame_path, 'image_name': image_name,
-            'session_id': session_id, 'beer_id': beer_id,
-            'batch': batch, 'filling_timestamp': filling_timestamp,
-            'detected_count': final_count,
-        }
-        self.data_ready_to_send = True
-        self.processing         = False
-
-        # Enable send button -> green
+        # UI feedback
         self.send_btn.disabled = False
         self.send_btn.set_preset('green')
         self.send_btn.text = 'SEND TO SERVER'
-
         self._set_status('', 'Capture Complete! Ready to Send.',
-                         f'{final_count} QR codes recorded',
+                         f'{self.session.count()} QR codes recorded',
                          'Ready', C['green'])
         self.show_toast('Capture Complete! Ready to Send.', 'success')
+        self.add_log(f"Captured session {session_id} | {self.session.count()} QRs")
 
     # --------------------------------------------------------
     #  SEND TO SERVER  (WITH PRINTER INTEGRATION)
     # --------------------------------------------------------
     def send_to_server(self, instance):
-        if not self._pending_capture:
+        # Guard: only send when in READY state
+        if self.session.state != ScanState.READY:
             return
+
+        # Guard: count must match target exactly
+        qr_count = self.session.count()
+        if qr_count != self.session.target_count:
+            if qr_count > self.session.target_count:
+                self.show_toast(f'Too many QRs ({qr_count}). Target is {self.session.target_count}. Remove extras.', 'error')
+            else:
+                self.show_toast(f'Only {qr_count} QRs. Need {self.session.target_count}.', 'error')
+            return
+
+        self.session.state = ScanState.SENDING
         self.send_btn.disabled = True
         self.send_btn.set_preset('dim')
         self._set_status('', 'Sending to server...', 'Uploading batch data',
                          'Sending', C['orange'])
 
-        capture_data = self._pending_capture
+        # Snapshot all needed data before spawning the thread
+        s = self.session
 
         def process():
             try:
                 future = submit_batch(
-                    capture_data['frame_path'],
-                    capture_data['image_name'],
-                    capture_data['session_id'],
-                    self.required_keg_count,
-                    beer_type=capture_data['beer_id'],
-                    batch=capture_data['batch'],
-                    filling_date=capture_data['filling_timestamp'],
+                    frame_path    = s.frame_path,
+                    image_name    = s.image_name,
+                    session_id    = s.session_id,
+                    qr_codes      = s.qr_list(),
+                    required_count= s.target_count,
+                    beer_type     = s.beer_type_id,
+                    batch         = s.batch_number,
+                    filling_date  = s.captured_at.isoformat() if s.captured_at else None,
                 )
-                future.result()
-
-                pallet_id = None
-                try:
-                    response_str = self.database.get_batch_response(
-                        capture_data['session_id'])
-                    if response_str:
-                        resp = json.loads(response_str)
-                        pallet_id = (resp.get('paletteId')
-                                     or resp.get('palletId')
-                                     or resp.get('id'))
-                except Exception as e:
-                    main_logger.warning(f"Failed to parse response: {e}")
-
-                Clock.schedule_once(
-                    lambda dt: self.complete_capture(
-                        capture_data['session_id'], pallet_id))
+                result = future.result()   # dict: {success, pallet_id, error, qr_count}
+                Clock.schedule_once(lambda dt: self._on_send_complete(result))
             except Exception as e:
                 Clock.schedule_once(
-                    lambda dt: self.show_toast(f"Error: {e}", 'error'))
+                    lambda dt: self._on_send_complete({'success': False, 'error': str(e)}))
 
         threading.Thread(target=process, daemon=True).start()
 
-    def complete_capture(self, session_id, pallet_id=None):
-        if pallet_id:
-            self.show_toast(f"Pallet {pallet_id} Created!", 'success')
-            self.add_log(f"SUCCESS: Pallet {pallet_id} Created")
-            
-            # --- PRINTER TRIGGER ---
-            self.show_toast("Printing Pallet Label...", "success")
-            self.add_log(f"Sending Pallet ID '{pallet_id}' to Zebra Printer...")
-            print_success, err_msg = self.printer.print_pallet_qr(pallet_id)
-            if print_success:
-                self.show_toast("Pallet Label Printed!", "success")
+    def _on_send_complete(self, result):
+        """Called on the Kivy main thread after the background send finishes."""
+        if result.get('success'):
+            pallet_id = result.get('pallet_id')
+            if pallet_id:
+                self.show_toast(f"Pallet {pallet_id} Created!", 'success')
+                self.add_log(f"SUCCESS: Pallet {pallet_id} Created")
+                # Print label
+                if self.printer:
+                    self.show_toast("Printing Pallet Label...", "success")
+                    ok, err = self.printer.print_pallet_qr(pallet_id)
+                    if ok:
+                        self.show_toast("Pallet Label Printed!", "success")
+                    else:
+                        self.show_toast(f"Printer Error: {err}", "error")
             else:
-                self.show_toast(f"Printer Error: {err_msg}", "error")
-            # -----------------------
-            
-        else:
-            self.show_toast('Batch Sent!', 'success')
-            self.add_log("SUCCESS: Batch Sent")
+                self.show_toast('Batch Sent!', 'success')
+                self.add_log("SUCCESS: Batch Sent")
 
-        # Reset
-        self.clear_all_qr_codes()
-        self.latest_qr_results    = []
-        self.last_captured_qr_set = set()
-        self.data_ready_to_send   = False
-        self.send_btn.disabled    = True
+            self.session.mark_sent()   # records last_sent_qr_set, sets state=SENT
+            Clock.schedule_once(lambda dt: self._reset_session(), 2.0)
+        else:
+            error = result.get('error', 'Unknown error')
+            self.show_toast(f'Send failed — queued for retry', 'error')
+            self.add_log(f"FAILED: {error}")
+            # Roll back to READY so user can retry
+            self.session.state = ScanState.READY
+            self.send_btn.disabled = False
+            self.send_btn.set_preset('green')
+            self._set_status('', 'Send Failed — Retry?',
+                             'Tap Send to try again', 'Ready', C['green'])
+
+    def _reset_session(self):
+        """Reset to SCANNING state after a successful send."""
+        self.session.reset()
+        self.update_qr_list_display()
+        self.send_btn.disabled = True
         self.send_btn.set_preset('dim')
         self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                          'Scanning...', C['accent'])
-
         if self.is_auto_mode:
             self.add_log("Auto-resetting for next batch...")
 
@@ -1753,7 +1755,7 @@ class SimpleKegHMI(MDBoxLayout):
                     name = str(item)
                     self.beer_type_map[name] = name
                     names.append(name)
-        self.beer_types = names if names else ["Lager", "Ale", "Stout", "IPA"]
+        self.beer_types = names if names else []
         self.add_log(f"Beer types loaded: {len(self.beer_types)}")
 
     def add_log(self, message):
@@ -1805,6 +1807,8 @@ class SimpleKegApp(MDApp):
             print(f"Error shutting down worker: {e}")
         hmi = getattr(self, '_hmi', None)
         if hmi:
+            if getattr(hmi, 'qr_detector', None):
+                hmi.qr_detector.shutdown()
             if getattr(hmi, 'camera', None):
                 hmi.camera.stop()
             if getattr(hmi, 'api_sender', None):
@@ -1812,4 +1816,14 @@ class SimpleKegApp(MDApp):
 
 
 if __name__ == '__main__':
+    import signal
+
+    def _signal_handler(sig, frame):
+        app = MDApp.get_running_app()
+        if app:
+            app.stop()
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     SimpleKegApp().run()

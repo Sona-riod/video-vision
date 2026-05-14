@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Dict, Any
 import threading
-from config import DB_PATH, DB_TIMEOUT
+from config import DB_PATH
 
 # Thread-safe DB access
 db_lock = threading.RLock()
@@ -17,10 +17,9 @@ class DatabaseManager:
 
     def _init_db(self):
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('PRAGMA journal_mode=WAL;')
-            cur.execute('PRAGMA synchronous=FULL;')  # Added for dirty-power resiliency
             cur.execute('PRAGMA foreign_keys = ON;')
             
             # Enhanced detection_sessions table with batch tracking
@@ -39,7 +38,7 @@ class DatabaseManager:
                     advanced_detection_used INTEGER DEFAULT 0,
                     advanced_qr_found INTEGER DEFAULT 0,
                     qr_list TEXT DEFAULT '[]',
-                    beer_type TEXT DEFAULT 'Lager',
+                    beer_type TEXT,
                     batch TEXT,
                     filling_date TEXT,
                     batch_status TEXT DEFAULT 'captured',
@@ -156,7 +155,7 @@ class DatabaseManager:
     def _migrate_schema(self):
         """Migrate existing database to new schema"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             
             try:
@@ -186,7 +185,7 @@ class DatabaseManager:
             ('require_attention', "ALTER TABLE detection_sessions ADD COLUMN require_attention INTEGER DEFAULT 0"),
             ('attention_reason', "ALTER TABLE detection_sessions ADD COLUMN attention_reason TEXT"),
             ('target_keg_count', "ALTER TABLE detection_sessions ADD COLUMN target_keg_count INTEGER DEFAULT 6"),
-            ('beer_type', "ALTER TABLE detection_sessions ADD COLUMN beer_type TEXT DEFAULT 'Lager'"),
+            ('beer_type', "ALTER TABLE detection_sessions ADD COLUMN beer_type TEXT"),
             ('api_status', "ALTER TABLE detection_sessions ADD COLUMN api_status TEXT DEFAULT 'pending'"),
             ('batch', "ALTER TABLE detection_sessions ADD COLUMN batch TEXT"),
             ('filling_date', "ALTER TABLE detection_sessions ADD COLUMN filling_date TEXT"),
@@ -277,45 +276,106 @@ class DatabaseManager:
 
     def _next_batch_number(self) -> int:
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('SELECT MAX(slno) FROM detection_sessions')
             mx = cur.fetchone()[0]
             conn.close()
             return 1 if mx is None else mx + 1
 
-    def start_session(self, source_image: str, target_keg_count: int = 6, 
-                     beer_type: str = "Lager", batch: str = None, 
+    def start_session(self, source_image: str, target_keg_count: int = 6,
+                     beer_type: str = "", batch: str = None,
                      filling_date: str = None) -> Tuple[int, str]:
         batch_no = self._next_batch_number()
         session_id = f"BATCH_{batch_no:04d}"
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
-                INSERT INTO detection_sessions 
-                (session_id, source_image, session_timestamp, detectionstart, 
-                 target_keg_count, beer_type, batch, filling_date, batch_status) 
+                INSERT INTO detection_sessions
+                (session_id, source_image, session_timestamp, detectionstart,
+                 target_keg_count, beer_type, batch, filling_date, batch_status)
                 VALUES (?, ?, ?, 1, ?, ?, ?, ?, 'captured')
-            ''', (session_id, source_image, datetime.now(), target_keg_count, 
+            ''', (session_id, source_image, datetime.now(), target_keg_count,
                   beer_type, batch, filling_date))
-            
-            # Log system event
+
             cur.execute('''
                 INSERT INTO system_events (event_type, details)
                 VALUES (?, ?)
-            ''', ('session_started', 
+            ''', ('session_started',
                   f'{session_id} - Beer: {beer_type}, Target: {target_keg_count}, Batch: {batch}'))
-            
+
             conn.commit()
             conn.close()
-        
+
         print(f"[DB] STARTED {session_id} | Target: {target_keg_count} | Beer: {beer_type} | Batch: {batch} | Image: {source_image}")
         return batch_no, session_id
 
+    def start_session_complete(self, session_id: str, source_image: str,
+                               qr_list: List[str], beer_type: str, batch: str,
+                               filling_date: str, target_count: int,
+                               decoded_cnt: int, adv_used: int, adv_found: int,
+                               adimgp: int, elapsed: float, api_status: str,
+                               batch_status: str, pallet_id: Optional[str],
+                               error_msg: Optional[str], payload: Optional[dict]):
+        """
+        Single-shot DB write at the end of processing.
+        Replaces the 5-6 intermediate writes (update_batch_status, store_qr_codes,
+        mark_pallet_processed, store_api_payload, finish_session, api_sender DB write).
+        Uses INSERT OR REPLACE so a re-send on retry updates the existing row cleanly.
+        """
+        qr_json      = json.dumps(qr_list)
+        payload_json = json.dumps(payload, default=str) if payload else None
+
+        with db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=60)
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT OR REPLACE INTO detection_sessions
+                    (session_id, source_image, session_timestamp, detectionstart,
+                     target_keg_count, beer_type, batch, filling_date,
+                     qr_list, decodedqrcodes, totaldetection,
+                     advanced_detection_used, advanced_qr_found, adimgp,
+                     processing_time, api_status, batch_status,
+                     pallet_id, last_error, api_payload,
+                     require_attention, attention_reason,
+                     last_api_attempt)
+                VALUES
+                    (?, ?, ?, 0,
+                     ?, ?, ?, ?,
+                     ?, ?, ?,
+                     ?, ?, ?,
+                     ?, ?, ?,
+                     ?, ?, ?,
+                     ?, ?,
+                     ?)
+            ''', (
+                session_id, source_image, datetime.now(), target_count,
+                beer_type, batch, filling_date,
+                qr_json, decoded_cnt, decoded_cnt,
+                adv_used, adv_found, adimgp,
+                elapsed, api_status, batch_status,
+                pallet_id, error_msg, payload_json,
+                1 if batch_status == 'api_failed' else 0,
+                error_msg if batch_status == 'api_failed' else None,
+                datetime.now(),
+            ))
+
+            # Log the completion event
+            cur.execute('''
+                INSERT INTO system_events (event_type, details)
+                VALUES (?, ?)
+            ''', ('batch_completed',
+                  f'{session_id} | {decoded_cnt}/{target_count} QRs | API:{api_status} | {elapsed:.2f}s'))
+
+            conn.commit()
+            conn.close()
+
+        print(f"[DB] WROTE {session_id} | {decoded_cnt} QRs | {batch_status} | {elapsed:.2f}s")
+
     def _insert_global_qr(self, qr: str, source_image: str, method: str, keg_type: str = 'Unknown') -> bool:
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             try:
                 cur.execute('''
@@ -339,7 +399,7 @@ class DatabaseManager:
     def store_registered_keg(self, qr_data: str, keg_type: str):
         """Store or update keg type for a QR code"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 INSERT OR REPLACE INTO decoded_data (qr_data, keg_type) 
@@ -351,7 +411,7 @@ class DatabaseManager:
     def get_keg_type(self, qr_data: str) -> str:
         """Get keg type for a QR code"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute("SELECT keg_type FROM decoded_data WHERE qr_data = ?", (qr_data,))
             row = cur.fetchone()
@@ -372,7 +432,7 @@ class DatabaseManager:
                          for q, k in zip(unique_qrs, unique_types))
 
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 UPDATE detection_sessions 
@@ -382,14 +442,14 @@ class DatabaseManager:
             conn.commit()
             conn.close()
         
-        print(f"[DB] {session_id} -> {len(unique_qrs)} QR(s) stored ({new_global} new)")
+        print(f"[DB] {session_id} → {len(unique_qrs)} QR(s) stored ({new_global} new)")
         return new_global, len(unique_qrs)
 
     def update_batch_status(self, session_id: str, status: str, error_msg: str = None, 
                           require_attention: bool = False, attention_reason: str = None):
         """Update batch status with detailed tracking"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             
             update_fields = ['batch_status = ?']
@@ -429,12 +489,12 @@ class DatabaseManager:
             conn.commit()
             conn.close()
         
-        print(f"[DB] {session_id} -> {status}" + (f" | Error: {error_msg}" if error_msg else ""))
+        print(f"[DB] {session_id} → {status}" + (f" | Error: {error_msg}" if error_msg else ""))
 
     def store_api_payload(self, session_id: str, payload: dict):
         """Store API payload for retry capability"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 UPDATE detection_sessions 
@@ -451,7 +511,7 @@ class DatabaseManager:
         status = "success" if api_success else "failed" if api_success is not None else "pending"
         
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 UPDATE detection_sessions 
@@ -467,7 +527,7 @@ class DatabaseManager:
     def get_batch_status(self, session_id: str) -> str:
         """Get batch status for a session"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute("SELECT batch_status FROM detection_sessions WHERE session_id = ?", (session_id,))
             row = cur.fetchone()
@@ -477,7 +537,7 @@ class DatabaseManager:
     def get_batch_response(self, session_id: str) -> str:
         """Get API response for a session"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute("SELECT api_response FROM detection_sessions WHERE session_id = ?", (session_id,))
             row = cur.fetchone()
@@ -487,7 +547,7 @@ class DatabaseManager:
     def get_decoded_count(self, session_id: str) -> int:
         """Get number of decoded QR codes for a session"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute("SELECT decodedqrcodes FROM detection_sessions WHERE session_id = ?", (session_id,))
             row = cur.fetchone()
@@ -497,7 +557,7 @@ class DatabaseManager:
     def mark_for_attention(self, session_id: str, reason: str):
         """Mark a batch as requiring attention"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 UPDATE detection_sessions 
@@ -510,7 +570,7 @@ class DatabaseManager:
     def resolve_attention(self, session_id: str):
         """Mark a batch as no longer requiring attention"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 UPDATE detection_sessions 
@@ -523,7 +583,7 @@ class DatabaseManager:
     def get_batches_requiring_attention(self) -> List[Dict[str, Any]]:
         """Get all batches that need operator attention"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 SELECT session_id, batch_status, last_error, decodedqrcodes, 
@@ -558,7 +618,7 @@ class DatabaseManager:
     def get_attention_batches(self) -> List[Dict[str, Any]]:
         """Get batches requiring attention (simplified format)"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 SELECT session_id, batch_status, attention_reason, decodedqrcodes, target_keg_count 
@@ -580,7 +640,7 @@ class DatabaseManager:
     def get_attention_count(self) -> int:
         """Count batches needing attention"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('SELECT COUNT(*) FROM detection_sessions WHERE require_attention = 1')
             count = cur.fetchone()[0]
@@ -590,7 +650,7 @@ class DatabaseManager:
     def add_to_retry_queue(self, session_id: str, payload: dict, error_msg: str = None):
         """Add batch to retry queue with exponential backoff"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             
             # Get current attempt count
@@ -614,7 +674,7 @@ class DatabaseManager:
     def get_retry_queue(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get batches ready for retry"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 SELECT session_id, payload, attempts, next_retry, error_message
@@ -646,7 +706,7 @@ class DatabaseManager:
     def remove_from_retry_queue(self, session_id: str):
         """Remove batch from retry queue after successful send"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('DELETE FROM retry_queue WHERE session_id = ?', (session_id,))
             conn.commit()
@@ -655,7 +715,7 @@ class DatabaseManager:
     def mark_batch_resolved(self, session_id: str, reason: str = "Manually resolved"):
         """Mark batch as resolved (no longer requires attention)"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 UPDATE detection_sessions 
@@ -668,7 +728,7 @@ class DatabaseManager:
     def get_stuck_batches(self, timeout_minutes: int = 10) -> List[str]:
         """Find batches stuck in processing state"""
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             timeout_time = datetime.now() - timedelta(minutes=timeout_minutes)
             cur.execute('''
@@ -684,7 +744,7 @@ class DatabaseManager:
 
     def get_session_data(self, session_id: str) -> Tuple[List[str], Optional[datetime]]:
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             try:
                 cur.execute("SELECT qr_list, session_timestamp FROM detection_sessions WHERE session_id = ?", (session_id,))
@@ -707,7 +767,7 @@ class DatabaseManager:
             return False, ""
         fingerprint = json.dumps(tuple(sorted(qr_codes)))
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute("SELECT batch_id FROM processed_pallets WHERE fingerprint = ?", (fingerprint,))
             row = cur.fetchone()
@@ -719,7 +779,7 @@ class DatabaseManager:
             return
         fingerprint = json.dumps(tuple(sorted(qr_codes)))
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             try:
                 cur.execute("INSERT INTO processed_pallets (fingerprint, batch_id) VALUES (?, ?)",
@@ -734,7 +794,7 @@ class DatabaseManager:
         """Check if pallet with same QR codes already exists"""
         fingerprint = json.dumps(tuple(sorted(qr_codes)))
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 SELECT pallet_id, status FROM pallet_lifecycle 
@@ -750,7 +810,7 @@ class DatabaseManager:
         fingerprint = json.dumps(tuple(sorted(qr_codes)))
         
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 INSERT INTO pallet_lifecycle 
@@ -765,7 +825,7 @@ class DatabaseManager:
 
     def print_summary(self):
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('SELECT COUNT(*) FROM detection_sessions'); batches = cur.fetchone()[0]
             cur.execute('SELECT COUNT(*) FROM decoded_data'); unique_qr = cur.fetchone()[0]
@@ -805,7 +865,7 @@ class DatabaseManager:
             return False, None
         
         with db_lock:
-            conn = sqlite3.connect(self.db_path, timeout=DB_TIMEOUT)
+            conn = sqlite3.connect(self.db_path, timeout=60)
             cur = conn.cursor()
             cur.execute('''
                 SELECT session_id FROM detection_sessions 

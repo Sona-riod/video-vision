@@ -3,7 +3,7 @@
 import sqlite3
 import logging
 from datetime import datetime, timedelta
-from config import DB_PATH, DB_TIMEOUT, RECOVERY_STUCK_TIMEOUT_MIN, RETRY_CLEANUP_DAYS
+from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +16,11 @@ def recover_system():
     stuck_count = 0
     
     try:
-        conn = sqlite3.connect(db_path, timeout=DB_TIMEOUT)
+        conn = sqlite3.connect(db_path, timeout=60)
         cur = conn.cursor()
         
         # 1. Find batches stuck in processing state
-        timeout_time = datetime.now() - timedelta(minutes=RECOVERY_STUCK_TIMEOUT_MIN)
+        timeout_time = datetime.now() - timedelta(minutes=10)
         cur.execute('''
             SELECT session_id, source_image, batch_status, session_timestamp
             FROM detection_sessions 
@@ -81,7 +81,7 @@ def recover_system():
                     logger.info(f"  - Added {session_id} to retry queue")
         
         # 3. Clean up old retry queue entries (older than 7 days)
-        week_ago = datetime.now() - timedelta(days=RETRY_CLEANUP_DAYS)
+        week_ago = datetime.now() - timedelta(days=7)
         cur.execute('''
             DELETE FROM retry_queue 
             WHERE created_at < ? AND attempts >= max_attempts
@@ -140,7 +140,7 @@ def check_database_integrity():
     db_path = str(DB_PATH)
     
     try:
-        conn = sqlite3.connect(db_path, timeout=DB_TIMEOUT)
+        conn = sqlite3.connect(db_path, timeout=60)
         cur = conn.cursor()
         
         # Check for orphaned retry queue entries

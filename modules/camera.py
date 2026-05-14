@@ -54,10 +54,14 @@ class CameraManager:
         
         logger.info(f"CameraManager initialized with config: {self.config.get('type', 'unknown')}")
 
-    def _open_device(self):
-        """Opens the camera device based on config. Returns True if successful."""
+    def start(self):
+        """Initializes and opens the camera based on the current configuration."""
+        if self.is_running and self.cap is not None:
+            logger.warning("Camera is already running.")
+            return True
+
         cam_type = self.config.get('type', 'v4l2').lower()
-        logger.info(f"Opening camera type: {cam_type}")
+        logger.info(f"Starting camera type: {cam_type}")
 
         try:
             # 1. V4L2 (USB Webcams)
@@ -76,6 +80,8 @@ class CameraManager:
             elif cam_type == 'webcam':
                 device = self.config.get('device', 0)
                 logger.debug(f"Opening Webcam device: {device}")
+                # On Windows, cv2.CAP_DSHOW can be faster/more compatible, but default is usually fine too.
+                # Using default backend for broadest compatibility.
                 self.cap = cv2.VideoCapture(device)
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.get('width', 640))
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.get('height', 480))
@@ -119,53 +125,12 @@ class CameraManager:
                 logger.info("[CAMERA] Started TEST mode")
 
             else:
-                logger.error(f"Unknown Camera Type: {cam_type}")
-                return False
+                raise ValueError(f"Unknown Camera Type: {cam_type}")
 
+            # Final Check
             if not self.cap.isOpened():
-                logger.error("Camera failed to open (isOpened=False)")
-                self.cap = None
-                return False
+                raise RuntimeError("Camera failed to open (isOpened=False)")
             
-            return True
-
-        except Exception as e:
-            logger.error(f"Camera Error during _open_device: {e}")
-            self.cap = None
-            return False
-
-    def _reconnect_camera(self):
-        """Internal method to gracefully reconnect camera without spawning new threads."""
-        logger.info("[CAMERA] Attempting to reconnect camera (ICAM-540 recovery)...")
-        
-        with self._frame_lock:
-            self._latest_ret = False
-            
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
-            
-        # Hardware reset delay
-        time.sleep(2.0)
-        
-        if self._open_device():
-            logger.info("[CAMERA] Reconnected successfully!")
-        else:
-            logger.warning("[CAMERA] Reconnect failed. Will try again.")
-
-    def start(self):
-        """Initializes and opens the camera, starting the background thread."""
-        if self.is_running and self.cap is not None:
-            logger.warning("Camera is already running.")
-        else:
-            # Try to open the device initially
-            if not self._open_device():
-                logger.error("Camera failed to open initially. Thread will keep trying.")
-                # We don't return False because we want the background thread to keep retrying
-                
             self.is_running = True
             
             # Start background capture thread
@@ -178,69 +143,53 @@ class CameraManager:
             self._capture_thread.start()
             logger.info("[CAMERA] Background capture thread started")
             
-        return True
+            return True
+
+        except Exception as e:
+            logger.error(f"Critical Camera Error during start: {e}")
+            self.cap = None
+            self.is_running = False
+            return False
 
     def _capture_loop(self):
         """Background thread for continuous frame capture."""
         logger.info("[CAMERA] Capture loop started")
-        consecutive_failures = 0
         
         while not self._stop_event.is_set():
             if self.cap is None:
-                # If camera is None, try to reconnect periodically
-                time.sleep(1.0)
-                self._reconnect_camera()
+                time.sleep(0.01)
                 continue
             
-            consecutive_failures = self._process_capture_step(consecutive_failures)
+            try:
+                start = time.perf_counter()
+                ret, frame = self.cap.read()
+                capture_time = (time.perf_counter() - start) * 1000
+                
+                # Auto-loop for video files
+                if not ret and self.config.get('type') == 'file':
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
+                
+                # Update shared frame with lock
+                with self._frame_lock:
+                    self._latest_ret = ret
+                    self._latest_frame = frame
+                
+                # Update FPS counter
+                self._frame_count += 1
+                now = time.time()
+                elapsed = now - self._last_fps_time
+                if elapsed >= 1.0:
+                    self._current_fps = self._frame_count / elapsed
+                    self._frame_count = 0
+                    self._last_fps_time = now
+                    logger.debug(f"Camera FPS: {self._current_fps:.1f}, capture time: {capture_time:.1f}ms")
+                    
+            except Exception as e:
+                logger.error(f"Capture error: {e}")
+                time.sleep(0.1)
         
         logger.info("[CAMERA] Capture loop stopped")
-
-    def _process_capture_step(self, consecutive_failures):
-        """Extracts the capture logic from the loop to reduce cognitive complexity."""
-        try:
-            start = time.perf_counter()
-            ret, frame = self.cap.read()
-            
-            # Auto-loop for video files
-            if not ret and self.config.get('type') == 'file':
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.cap.read()
-
-            # Retry logic
-            if not ret and self.config.get('type') != 'file':
-                consecutive_failures += 1
-                if consecutive_failures > 5:
-                    logger.warning("[CAMERA] Multiple read failures. Reinitializing...")
-                    self._reconnect_camera()
-                    return 0
-            else:
-                consecutive_failures = 0
-                
-            capture_time = (time.perf_counter() - start) * 1000
-            
-            # Update shared frame with lock
-            with self._frame_lock:
-                self._latest_ret = ret
-                self._latest_frame = frame
-            
-            # Update FPS counter
-            self._frame_count += 1
-            now = time.time()
-            elapsed = now - self._last_fps_time
-            if elapsed >= 1.0:
-                self._current_fps = self._frame_count / elapsed
-                self._frame_count = 0
-                self._last_fps_time = now
-                logger.debug(f"Camera FPS: {self._current_fps:.1f}, capture time: {capture_time:.1f}ms")
-                
-            return consecutive_failures
-            
-        except Exception as e:
-            logger.error(f"Capture error: {e}")
-            time.sleep(0.5)
-            self._reconnect_camera()
-            return consecutive_failures
 
     def get_frame(self):
         """
