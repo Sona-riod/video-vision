@@ -177,7 +177,7 @@ class GPUInfo:
                 
         except Exception as e:
             print(f"OpenCV CUDA: ERROR - {e}")
-            logger.error(f"OpenCV CUDA detection failed: {e}")
+            logger.exception("OpenCV CUDA detection failed")
 
     def _detect_pytorch_cuda(self, logger):
         """Detect PyTorch CUDA support (non-Mac systems)."""
