@@ -104,7 +104,7 @@ def submit_batch(frame_path: str,
             f.result()
             log.debug(f"[{session_id}] Background processing completed")
         except Exception as e:
-            log.error(f"[{session_id}] Background processing error: {e}")
+            log.exception(f"[{session_id}] Background processing error")
 
     future.add_done_callback(_callback)
     return future
@@ -151,7 +151,7 @@ def _process_one(frame_path: str,
                 adv_used = 1
                 log.info(f"[{session_id}] Advanced detection: {adv_found} found, combined total: {len(final_qrs)}")
             except Exception as e:
-                log.error(f"[{session_id}] Advanced detection failed: {e}")
+                log.exception(f"[{session_id}] Advanced detection failed")
 
         # ── 2. Build payload ──────────────────────────────────────────────
         payload = {
@@ -300,7 +300,7 @@ def _write_completed_batch(session_id, image_name, qr_codes, beer_type,
         )
         log.debug(f"[{session_id}] DB write complete | status={batch_status}")
     except Exception as e:
-        log.error(f"[{session_id}] DB write failed: {e}")
+        log.exception(f"[{session_id}] DB write failed")
 
     # On failure → add to retry_queue so it survives power loss
     if not api_success and payload:
@@ -308,7 +308,7 @@ def _write_completed_batch(session_id, image_name, qr_codes, beer_type,
             db.add_to_retry_queue(session_id, payload, error_msg or "Send failed")
             log.info(f"[{session_id}] Added to retry_queue")
         except Exception as e:
-            log.error(f"[{session_id}] Failed to add to retry_queue: {e}")
+            log.exception(f"[{session_id}] Failed to add to retry_queue")
 
 
 # ── Retry helper (called by recovery.py or manually) ─────────────────────────
@@ -339,7 +339,7 @@ def retry_failed_batch(session_id: str) -> bool:
             log.warning(f"[{session_id}] Retry failed")
         return success
     except Exception as e:
-        log.error(f"[{session_id}] Retry error: {e}")
+        log.exception(f"[{session_id}] Retry error")
         return False
 
 

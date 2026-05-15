@@ -58,11 +58,11 @@ class ZebraPrinter:
                 logger.info("Successfully printed using sudo tee fallback.")
                 return True, ""
             except Exception as e:
-                logger.error(f"Fallback printing failed: {e}")
+                logger.exception("Fallback printing failed")
                 return False, f"Fallback printing failed: {e}"
 
         except Exception as e:
-            logger.error(f"Printer error: {e}")
+            logger.exception("Printer error")
             return False, str(e)
 
     def _print_via_pyusb(self, zpl_command):
@@ -80,9 +80,62 @@ class ZebraPrinter:
 
         return self._write_to_usb_device(dev, zpl_command)
 
+    def _safe_reset(self, dev):
+        try:
+            dev.reset()
+        except Exception as e:
+            logger.warning(f"Device reset warning (non-fatal): {e}")
+
+    def _detach_kernel_drivers(self, dev):
+        detached_ifaces = []
+        for iface_num in range(dev.get_active_configuration().bNumInterfaces):
+            try:
+                if dev.is_kernel_driver_active(iface_num):
+                    dev.detach_kernel_driver(iface_num)
+                    detached_ifaces.append(iface_num)
+                    logger.debug(f"Detached kernel driver from interface {iface_num}")
+            except Exception as e:
+                logger.warning(f"Could not detach kernel driver from interface {iface_num}: {e}")
+        return detached_ifaces
+
+    def _safe_set_configuration(self, dev):
+        try:
+            dev.set_configuration()
+        except Exception as e:
+            logger.warning(f"set_configuration warning (non-fatal): {e}")
+
+    def _find_out_endpoint(self, intf):
+        import usb.util
+        return usb.util.find_descriptor(
+            intf,
+            custom_match=lambda e: (
+                usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+            ),
+        )
+
+    def _release_usb_resources(self, dev, interface_claimed, detached_ifaces):
+        import usb.util
+        if interface_claimed:
+            try:
+                cfg = dev.get_active_configuration()
+                intf = cfg[(0, 0)]
+                usb.util.release_interface(dev, intf.bInterfaceNumber)
+                logger.debug("Interface released.")
+            except Exception:
+                pass
+
+        for iface_num in detached_ifaces:
+            try:
+                dev.attach_kernel_driver(iface_num)
+                logger.debug(f"Re-attached kernel driver to interface {iface_num}")
+            except Exception as e:
+                logger.warning(f"Could not re-attach kernel driver to interface {iface_num}: {e}")
+
+        usb.util.dispose_resources(dev)
+        logger.debug("USB resources disposed — printer closed.")
+
     def _write_to_usb_device(self, dev, zpl_command, _retry=True):
         """Write ZPL to USB device, retrying once with a full reset on [Errno 5]."""
-        import usb.core
         import usb.util
 
         interface_claimed = False
@@ -90,25 +143,11 @@ class ZebraPrinter:
 
         try:
             # 1. Reset device to clear any stale USB state
-            try:
-                dev.reset()
-            except Exception as e:
-                logger.warning(f"Device reset warning (non-fatal): {e}")
+            self._safe_reset(dev)
 
-            # 2. Detach kernel driver (usblp) and track which interfaces were detached
-            for iface_num in range(dev.get_active_configuration().bNumInterfaces):
-                try:
-                    if dev.is_kernel_driver_active(iface_num):
-                        dev.detach_kernel_driver(iface_num)
-                        detached_ifaces.append(iface_num)
-                        logger.debug(f"Detached kernel driver from interface {iface_num}")
-                except Exception as e:
-                    logger.warning(f"Could not detach kernel driver from interface {iface_num}: {e}")
-
-            try:
-                dev.set_configuration()
-            except Exception as e:
-                logger.warning(f"set_configuration warning (non-fatal): {e}")
+            # 2. Detach kernel driver (usblp)
+            detached_ifaces = self._detach_kernel_drivers(dev)
+            self._safe_set_configuration(dev)
 
             cfg = dev.get_active_configuration()
             intf = cfg[(0, 0)]
@@ -117,13 +156,7 @@ class ZebraPrinter:
             usb.util.claim_interface(dev, intf.bInterfaceNumber)
             interface_claimed = True
 
-            ep = usb.util.find_descriptor(
-                intf,
-                custom_match=lambda e: (
-                    usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-                ),
-            )
-
+            ep = self._find_out_endpoint(intf)
             if ep is None:
                 logger.error("Endpoint not found via PyUSB.")
                 return False, "Endpoint not found"
@@ -135,15 +168,12 @@ class ZebraPrinter:
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"PyUSB printing failed: {e}")
+            logger.exception("PyUSB printing failed")
 
             if "[Errno 5]" in err_str and _retry:
                 # Hard reset and retry once on I/O error
                 logger.warning("Got [Errno 5] I/O error — resetting device and retrying once...")
-                try:
-                    dev.reset()
-                except Exception:
-                    pass
+                self._safe_reset(dev)
                 return self._write_to_usb_device(dev, zpl_command, _retry=False)
 
             if "Access denied" in err_str or "Insufficient permissions" in err_str:
@@ -152,24 +182,5 @@ class ZebraPrinter:
             return False, f"PyUSB failed: {e}"
 
         finally:
-            # 5. Release interface claim
-            if interface_claimed:
-                try:
-                    cfg = dev.get_active_configuration()
-                    intf = cfg[(0, 0)]
-                    usb.util.release_interface(dev, intf.bInterfaceNumber)
-                    logger.debug("Interface released.")
-                except Exception:
-                    pass
-
-            # 6. Re-attach kernel driver — return printer to OS
-            for iface_num in detached_ifaces:
-                try:
-                    dev.attach_kernel_driver(iface_num)
-                    logger.debug(f"Re-attached kernel driver to interface {iface_num}")
-                except Exception as e:
-                    logger.warning(f"Could not re-attach kernel driver to interface {iface_num}: {e}")
-
-            # 7. Free all PyUSB resources
-            usb.util.dispose_resources(dev)
-            logger.debug("USB resources disposed — printer closed.")
+            # 5. Release resources
+            self._release_usb_resources(dev, interface_claimed, detached_ifaces)
