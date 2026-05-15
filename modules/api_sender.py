@@ -272,21 +272,21 @@ class APISender:
 
         except requests.exceptions.Timeout:
             last_error = "Request timeout"
-            print(f"\nSTEP 6: TIMEOUT ERROR")
+            print("\nSTEP 6: TIMEOUT ERROR")
             print(f"  Request timed out after {self.timeout} seconds")
             self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
             return False, None, last_error, False
 
         except requests.exceptions.RequestException as e:
             last_error = f"Network error: {str(e)}"
-            print(f"\nSTEP 6: NETWORK ERROR")
+            print("\nSTEP 6: NETWORK ERROR")
             print(f"  Error: {e}")
             self.logger.warning(f"Batch {batch_id}: {last_error} (attempt {attempt})")
             return False, None, last_error, False
 
         except Exception as e:
             last_error = f"Unexpected error: {str(e)}"
-            print(f"\nSTEP 6: UNEXPECTED ERROR")
+            print("\nSTEP 6: UNEXPECTED ERROR")
             print(f"  Error: {e}")
             self.logger.error(f"Batch {batch_id}: {last_error}")
             return False, None, last_error, True   # Break on unexpected errors
