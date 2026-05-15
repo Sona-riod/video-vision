@@ -18,6 +18,7 @@ if not SSL_VERIFY:
 HTTP_PREFIX = "https://"
 HTTPS_PREFIX = "https://"
 CONTENT_TYPE_JSON = "application/json"
+BEER_ENDPOINT_ERR_MSG = "Beer types endpoint failed."
 
 # Thread lock for database access
 db_lock = threading.RLock()
@@ -92,24 +93,24 @@ class APISender:
             
         except requests.exceptions.SSLError as e:
             self.logger.warning(f"SSL error: {e}")
-            self.logger.error("Beer types endpoint failed.")
+            self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
         except requests.exceptions.Timeout:
             self.logger.warning(f"Timeout connecting to beer types endpoint")
-            self.logger.error("Beer types endpoint failed.")
+            self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
         except requests.exceptions.RequestException as e:
             self.logger.warning(f"Network error: {e}")
-            self.logger.error("Beer types endpoint failed.")
+            self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
         except Exception as e:
             self.logger.warning(f"Unexpected error: {e}")
-            self.logger.error("Beer types endpoint failed.")
+            self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
             
         if response.status_code != 200:
             self.logger.warning(f"Unexpected status {response.status_code}: {response.text[:200]}")
-            self.logger.error("Beer types endpoint failed.")
+            self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
             
         try:
@@ -130,7 +131,7 @@ class APISender:
         except Exception as e:
             self.logger.warning(f"Error parsing response: {e}")
             
-        self.logger.error("Beer types endpoint failed.")
+        self.logger.error(BEER_ENDPOINT_ERR_MSG)
         return []
 
     def _process_beer_types_response(self, data):
