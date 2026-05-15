@@ -276,7 +276,7 @@ class AdvancedQRDetector:
         return list(unique_qr_codes)
 
     def _process_tiles(self, tiles_dir, cropped_dir):
-        logger.info(f"Advanced: Step 2 - Processing tiles...")
+        logger.info("Advanced: Step 2 - Processing tiles...")
         all_cropped_paths = []
         total_detections = 0
         

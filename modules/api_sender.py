@@ -96,7 +96,7 @@ class APISender:
             self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
         except requests.exceptions.Timeout:
-            self.logger.warning(f"Timeout connecting to beer types endpoint")
+            self.logger.warning("Timeout connecting to beer types endpoint")
             self.logger.error(BEER_ENDPOINT_ERR_MSG)
             return []
         except requests.exceptions.RequestException as e:
@@ -124,7 +124,7 @@ class APISender:
                 self.logger.info(f"Successfully fetched {len(beer_types)} beer types")
                 return beer_types
                 
-            self.logger.warning(f"Endpoint returned empty beer types list")
+            self.logger.warning("Endpoint returned empty beer types list")
             
         except json.JSONDecodeError:
             self.logger.warning(f"Invalid JSON response: {response.text[:100]}")
