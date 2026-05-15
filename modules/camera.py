@@ -106,7 +106,7 @@ class CameraManager:
                     f"nvarguscamerasrc sensor-id={sensor_id} ! "
                     f"video/x-raw(memory:NVMM), width={width}, height={height}, "
                     f"format=NV12, framerate={fps}/1 ! "
-                    f"nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
+                    "nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
                 )
                 logger.debug(f"Opening CSI with pipeline: {gst_pipeline}")
                 self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)

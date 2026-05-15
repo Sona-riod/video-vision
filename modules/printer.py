@@ -15,7 +15,7 @@ class ZebraPrinter:
                 self.device_path = usb_printers[0]
                 logger.info(f"Default printer {device_path} not found. Auto-detected {self.device_path}")
             else:
-                logger.warning(f"No USB printers found in /dev/usb/lp*. Enabling PyUSB fallback.")
+                logger.warning("No USB printers found in /dev/usb/lp*. Enabling PyUSB fallback.")
                 self.use_pyusb = True
 
     def print_pallet_qr(self, pallet_id):

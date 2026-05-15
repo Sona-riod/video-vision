@@ -209,7 +209,7 @@ class DatabaseManager:
         if 'keg_type' not in columns:
             try:
                 cur.execute("ALTER TABLE decoded_data ADD COLUMN keg_type TEXT DEFAULT 'Unknown'")
-                print(f"[DB] Added column to decoded_data: keg_type")
+                print("[DB] Added column to decoded_data: keg_type")
             except Exception as e:
                 print(f"[DB] Error adding keg_type to decoded_data: {e}")
 

@@ -360,7 +360,7 @@ class QRDetector:
         
         # If capture mode and Pyzbar failed, try QReader on crop
         if not decoded and use_qreader and self.qreader is not None:
-             logger.info(f"[CAPTURE] Pyzbar failed, trying QReader on crop...")
+             logger.info("[CAPTURE] Pyzbar failed, trying QReader on crop...")
              decoded = self._decode_qreader(crop)
         
         for result_item in decoded:
@@ -470,14 +470,14 @@ def detect_qr_advanced(image_path):
     """
     Advanced QR detection from file path.
     """
-    print(f"\n[ADVANCED] --------------------------------------------------")
+    print("\n[ADVANCED] --------------------------------------------------")
     print(f"[ADVANCED] Starting Advanced Detection on: {image_path}")
-    print(f"[ADVANCED] --------------------------------------------------")
+    print("[ADVANCED] --------------------------------------------------")
     
     try:
         frame = cv2.imread(str(image_path))
         if frame is None:
-            print(f"[ADVANCED] ERROR: Could not read image file")
+            print("[ADVANCED] ERROR: Could not read image file")
             return [], 0
             
         print(f"[ADVANCED] Image loaded successfully: {frame.shape}")
@@ -489,9 +489,9 @@ def detect_qr_advanced(image_path):
         if count > 0:
             print(f"[ADVANCED] Detected QR Data: {[r['data'] for r in results]}")
         else:
-            print(f"[ADVANCED] No QR codes found.")
+            print("[ADVANCED] No QR codes found.")
             
-        print(f"[ADVANCED] --------------------------------------------------\n")
+        print("[ADVANCED] --------------------------------------------------\n")
         return results, count
     except Exception as e:
         logger.exception("detect_qr_advanced Error")
