@@ -111,7 +111,7 @@ class GPUInfo:
         except ImportError:
             print("PyTorch: NOT INSTALLED")
         except Exception as e:
-            print("MPS Detection Error: {e}")
+            print(f"MPS Detection Error: {e}")
 
     def _is_mps_available(self, torch):
         """Check if PyTorch MPS is available."""
@@ -131,7 +131,7 @@ class GPUInfo:
             self.cuda_device_name = gpu_name
         
         print("PyTorch MPS (Metal): AVAILABLE")
-        print("GPU: {GPU_STATUS['gpu_name']}")
+        print(f"GPU: {GPU_STATUS['gpu_name']}")
         logger.info(f"Mac Metal GPU enabled: {GPU_STATUS['gpu_name']}")
 
     def _handle_mps_unavailable(self, logger):

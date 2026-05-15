@@ -172,22 +172,22 @@ def _process_one(frame_path: str,
 
         # ── 4. ONE DB write at the end ────────────────────────────────────
         elapsed = time.time() - start
-        _write_completed_batch(
-            session_id   = session_id,
-            image_name   = image_name,
-            qr_codes     = final_qrs,
-            beer_type    = beer_type,
-            batch        = batch,
-            filling_date = filling_date,
-            required_count = required_count,
-            adv_used     = adv_used,
-            adv_found    = adv_found,
-            elapsed      = elapsed,
-            api_success  = api_success,
-            pallet_id    = pallet_id,
-            error_msg    = error_msg,
-            payload      = payload,
-        )
+        _write_completed_batch({
+            "session_id":   session_id,
+            "image_name":   image_name,
+            "qr_codes":     final_qrs,
+            "beer_type":    beer_type,
+            "batch":        batch,
+            "filling_date": filling_date,
+            "required_count": required_count,
+            "adv_used":     adv_used,
+            "adv_found":    adv_found,
+            "elapsed":      elapsed,
+            "api_success":  api_success,
+            "pallet_id":    pallet_id,
+            "error_msg":    error_msg,
+            "payload":      payload,
+        })
 
         # Clean up frame on success
         if api_success and os.path.exists(frame_path):
@@ -215,14 +215,14 @@ def _process_one(frame_path: str,
         log.exception("Processing error details")
 
         # Write failure record — frame preserved for manual recovery
-        _write_completed_batch(
-            session_id=session_id, image_name=image_name,
-            qr_codes=list(qr_codes), beer_type=beer_type, batch=batch,
-            filling_date=filling_date, required_count=required_count,
-            adv_used=0, adv_found=0, elapsed=elapsed,
-            api_success=False, pallet_id=None,
-            error_msg=error_msg, payload=None,
-        )
+        _write_completed_batch({
+            "session_id": session_id, "image_name": image_name,
+            "qr_codes": list(qr_codes), "beer_type": beer_type, "batch": batch,
+            "filling_date": filling_date, "required_count": required_count,
+            "adv_used": 0, "adv_found": 0, "elapsed": elapsed,
+            "api_success": False, "pallet_id": None,
+            "error_msg": error_msg, "payload": None,
+        })
         return {"success": False, "pallet_id": None, "error": error_msg, "qr_count": 0}
 
 
@@ -264,14 +264,18 @@ def _send_to_api(session_id: str, payload: dict):
 
 # ── Single DB write ──────────────────────────────────────────────────────────
 
-def _write_completed_batch(session_id, image_name, qr_codes, beer_type,
-                           batch, filling_date, required_count,
-                           adv_used, adv_found, elapsed,
-                           api_success, pallet_id, error_msg, payload):
+def _write_completed_batch(ctx: Dict[str, Any]):
     """
     Write everything to the database in ONE call at the end of processing.
     Uses the existing detection_sessions + retry_queue tables unchanged.
     """
+    session_id     = ctx["session_id"]
+    qr_codes       = ctx["qr_codes"]
+    required_count = ctx["required_count"]
+    api_success    = ctx["api_success"]
+    payload        = ctx["payload"]
+    error_msg      = ctx["error_msg"]
+
     decoded_cnt = len(qr_codes)
     adimgp      = 1 if decoded_cnt < required_count else 0
     api_status  = "success" if api_success else "failed"
@@ -281,20 +285,20 @@ def _write_completed_batch(session_id, image_name, qr_codes, beer_type,
         # Insert the session record (single write)
         db.start_session_complete(
             session_id    = session_id,
-            source_image  = image_name,
+            source_image  = ctx["image_name"],
             qr_list       = qr_codes,
-            beer_type     = beer_type,
-            batch         = batch,
-            filling_date  = filling_date,
+            beer_type     = ctx["beer_type"],
+            batch         = ctx["batch"],
+            filling_date  = ctx["filling_date"],
             target_count  = required_count,
             decoded_cnt   = decoded_cnt,
-            adv_used      = adv_used,
-            adv_found     = adv_found,
+            adv_used      = ctx["adv_used"],
+            adv_found     = ctx["adv_found"],
             adimgp        = adimgp,
-            elapsed       = elapsed,
+            elapsed       = ctx["elapsed"],
             api_status    = api_status,
             batch_status  = batch_status,
-            pallet_id     = pallet_id,
+            pallet_id     = ctx["pallet_id"],
             error_msg     = error_msg,
             payload       = payload,
         )
@@ -326,7 +330,7 @@ def retry_failed_batch(session_id: str) -> bool:
             return False
 
         payload = item["payload"]
-        success, pallet_id = _api_sender.send_batch(
+        success, _ = _api_sender.send_batch(
             batch_id = session_id,
             qr_codes = payload.get("kegIds", []),
             payload  = payload,
