@@ -304,7 +304,7 @@ class APISender:
         print(f"STEP 5: Sending request (Attempt {attempt}/{start_attempt + self.max_retries})")
         print("="*60)
         print(f"  URL: {self.api_url}")
-        print(f"  Method: POST")
+        print("  Method: POST")
         print(f"  Timeout: {self.timeout} seconds")
         print(f"  SSL Verify: {SSL_VERIFY}")
 
@@ -361,7 +361,7 @@ class APISender:
             pallet_id = (resp_data.get('paletteId')
                          or resp_data.get('palletId')
                          or resp_data.get('id'))
-            print(f"  Parsed JSON successfully")
+            print("  Parsed JSON successfully")
             print(f"  Pallet ID: {pallet_id}")
             self.logger.info(f"Batch {batch_id} sent successfully. Pallet ID: {pallet_id}")
         except Exception as parse_err:
@@ -395,7 +395,7 @@ class APISender:
                 self.logger.error(f"Failed to update error for {batch_id}: {e}")
     
     def _attempt_http_fallback(self, e, batch_id, payload, headers):
-        print(f"\nSTEP 6: SSL ERROR")
+        print("\nSTEP 6: SSL ERROR")
         print(f"  Error: {e}")
         # Try HTTP fallback if HTTPS fails
         if self.api_url.startswith(HTTPS_PREFIX):
@@ -410,7 +410,7 @@ class APISender:
                     timeout=self.timeout
                 )
                 if response.status_code in [200, 201]:
-                    print(f"  HTTP fallback SUCCESS!")
+                    print("  HTTP fallback SUCCESS!")
                     self.logger.info(f"Batch {batch_id} sent via HTTP fallback")
                     return True
             except Exception as fallback_err:
