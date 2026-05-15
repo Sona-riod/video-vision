@@ -66,7 +66,7 @@ def manage_storage(folder_path, max_size_mb):
             logging.info(f"Storage cleanup: Deleted {deleted_size / (1024 * 1024):.2f} MB")
             
     except Exception as e:
-        logging.error(f"Storage management failed: {e}")
+        logging.exception("Storage management failed")
 
 def create_timestamp():
     """Create standardized timestamp"""
@@ -91,7 +91,7 @@ def safe_delete(file_path):
             os.remove(file_path)
             return True
     except Exception as e:
-        logging.error(f"Safe delete failed for {file_path}: {e}")
+        logging.exception(f"Safe delete failed for {file_path}")
     return False
 
 def format_duration(seconds):
@@ -135,7 +135,7 @@ def save_last_batch(batch_number: str):
         logging.info(f"Saved last batch: {batch_number}")
         return True
     except Exception as e:
-        logging.error(f"Failed to save last batch: {e}")
+        logging.exception("Failed to save last batch")
         return False
 
 def load_last_batch() -> str:
@@ -154,5 +154,5 @@ def load_last_batch() -> str:
         # Return default if file doesn't exist or is empty
         return "BATCH-001"
     except Exception as e:
-        logging.error(f"Failed to load last batch: {e}")
+        logging.exception("Failed to load last batch")
         return "BATCH-001"

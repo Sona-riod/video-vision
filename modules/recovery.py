@@ -126,7 +126,7 @@ def recover_system():
         }
         
     except Exception as e:
-        logger.error(f"System recovery failed: {e}")
+        logger.exception("System recovery failed")
         return {
             'success': False,
             'error': str(e),
@@ -183,7 +183,7 @@ def check_database_integrity():
         return True
         
     except Exception as e:
-        logger.error(f"Database integrity check failed: {e}")
+        logger.exception("Database integrity check failed")
         return False
 
 if __name__ == "__main__":
