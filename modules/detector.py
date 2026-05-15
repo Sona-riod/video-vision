@@ -50,7 +50,7 @@ try:
     print("[DETECTOR] YOLO: LOADED")
 except Exception as e:
     print(f"[DETECTOR] YOLO: NOT AVAILABLE ({e})")
-    print(f"[DETECTOR] Warning: Running without YOLO (Deep Learning) support.")
+    print("[DETECTOR] Warning: Running without YOLO (Deep Learning) support.")
 
 # QReader (lazy loaded - only when needed for deep scan)
 QREADER_AVAILABLE = False
@@ -71,7 +71,7 @@ except ImportError:
     QR_MODEL_PATH = Path(__file__).parent.parent / "models" / "model_qr" / "best.pt"
 
 print("="*60)
-print(f"DETECTOR STATUS:")
+print("DETECTOR STATUS:")
 print(f"   Pyzbar: {'OK' if PYZBAR_AVAILABLE else 'FAILED'}")
 print(f"   YOLO: {'OK' if YOLO_AVAILABLE else 'FAILED'}")
 print(f"   QReader: {'OK (lazy)' if QREADER_AVAILABLE else 'NOT AVAILABLE'}")

@@ -1619,7 +1619,7 @@ class SimpleKegHMI(MDBoxLayout):
             Clock.schedule_once(lambda dt: self._reset_session(), 2.0)
         else:
             error = result.get('error', 'Unknown error')
-            self.show_toast(f'Send failed — queued for retry', 'error')
+            self.show_toast('Send failed — queued for retry', 'error')
             self.add_log(f"FAILED: {error}")
             # Roll back to READY so user can retry
             self.session.state = ScanState.READY
