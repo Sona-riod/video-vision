@@ -88,39 +88,48 @@ class APISender:
             
             # User requested POST for beer types
             response = self.session.post(self.beer_types_url, json=payload, headers=headers, timeout=5)
-            
             self.logger.info(f"Response status: {response.status_code}")
             
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    self.logger.debug(f"Beer types response keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
-                    
-                    beer_types = self._process_beer_types_response(data)
-                    
-                    if beer_types and len(beer_types) > 0:
-                        self.logger.info(f"Successfully fetched {len(beer_types)} beer types")
-                        return beer_types
-                    else:
-                        self.logger.warning(f"Endpoint returned empty beer types list")
-                        
-                except json.JSONDecodeError:
-                    self.logger.warning(f"Invalid JSON response: {response.text[:100]}")
-                except Exception as e:
-                    self.logger.warning(f"Error parsing response: {e}")
-            else:
-                self.logger.warning(f"Unexpected status {response.status_code}: {response.text[:200]}")
-                
         except requests.exceptions.SSLError as e:
             self.logger.warning(f"SSL error: {e}")
+            self.logger.error("Beer types endpoint failed.")
+            return []
         except requests.exceptions.Timeout:
             self.logger.warning(f"Timeout connecting to beer types endpoint")
+            self.logger.error("Beer types endpoint failed.")
+            return []
         except requests.exceptions.RequestException as e:
             self.logger.warning(f"Network error: {e}")
+            self.logger.error("Beer types endpoint failed.")
+            return []
         except Exception as e:
             self.logger.warning(f"Unexpected error: {e}")
-        
-        # If the configured endpoint fails, use fallback
+            self.logger.error("Beer types endpoint failed.")
+            return []
+            
+        if response.status_code != 200:
+            self.logger.warning(f"Unexpected status {response.status_code}: {response.text[:200]}")
+            self.logger.error("Beer types endpoint failed.")
+            return []
+            
+        try:
+            data = response.json()
+            keys_info = list(data.keys()) if isinstance(data, dict) else 'list'
+            self.logger.debug(f"Beer types response keys: {keys_info}")
+            
+            beer_types = self._process_beer_types_response(data)
+            
+            if beer_types and len(beer_types) > 0:
+                self.logger.info(f"Successfully fetched {len(beer_types)} beer types")
+                return beer_types
+                
+            self.logger.warning(f"Endpoint returned empty beer types list")
+            
+        except json.JSONDecodeError:
+            self.logger.warning(f"Invalid JSON response: {response.text[:100]}")
+        except Exception as e:
+            self.logger.warning(f"Error parsing response: {e}")
+            
         self.logger.error("Beer types endpoint failed.")
         return []
 

@@ -160,7 +160,7 @@ class AdvancedQRDetector:
             return decoded_objects, len(decoded_objects) > 0
             
         except Exception as e:
-            logger.error(f"Advanced: Error decoding QR code with pyzbar: {e}")
+            logger.exception("Advanced: Error decoding QR code with pyzbar")
             return [], False
 
     def detect_and_crop_qr_yolo(self, image_path, output_dir):
@@ -227,7 +227,7 @@ class AdvancedQRDetector:
             decoded_qrs = self.qreader.detect_and_decode(image=image)
             return [qr.strip() for qr in decoded_qrs if qr and len(qr.strip()) > 0]
         except Exception as e:
-            logger.error(f"Advanced: QReader error for {image_path}: {e}")
+            logger.exception(f"Advanced: QReader error for {image_path}")
             return []
 
     def detect_advanced(self, image_path, temp_dir="advanced_temp"):
@@ -265,7 +265,7 @@ class AdvancedQRDetector:
             logger.info(f"Advanced: Decoding completed. Unique QR codes found: {len(unique_qr_codes)}")
             
         except Exception as e:
-            logger.error(f"Advanced: Error in advanced detection pipeline: {e}")
+            logger.exception("Advanced: Error in advanced detection pipeline")
         
         finally:
             # Clean up temporary files

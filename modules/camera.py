@@ -146,7 +146,7 @@ class CameraManager:
             return True
 
         except Exception as e:
-            logger.error(f"Critical Camera Error during start: {e}")
+            logger.exception("Critical Camera Error during start")
             self.cap = None
             self.is_running = False
             return False
@@ -186,7 +186,7 @@ class CameraManager:
                     logger.debug(f"Camera FPS: {self._current_fps:.1f}, capture time: {capture_time:.1f}ms")
                     
             except Exception as e:
-                logger.error(f"Capture error: {e}")
+                logger.exception("Capture error")
                 time.sleep(0.1)
         
         logger.info("[CAMERA] Capture loop stopped")

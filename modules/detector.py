@@ -102,7 +102,7 @@ class QRDetector:
                 self.model = YOLO(model_path)
                 logger.info("YOLO model loaded successfully")
             except Exception as e:
-                logger.error(f"Failed to load YOLO model: {e}")
+                logger.exception("Failed to load YOLO model")
                 self.model = None
         
         # OpenCV QR detector as last resort fallback
@@ -144,7 +144,7 @@ class QRDetector:
                 elapsed = (time.perf_counter() - start) * 1000
                 logger.info(f"QReader initialized in {elapsed:.0f}ms")
             except Exception as e:
-                logger.error(f"QReader init failed: {e}")
+                logger.exception("QReader init failed")
                 self.qreader_available = False
                 self.qreader = None
         
@@ -335,7 +335,7 @@ class QRDetector:
                 for box in result.boxes:
                     self._process_yolo_box(box, frame, h, w, use_qreader, all_results, seen_texts)
         except Exception as e:
-            logger.error(f"YOLO detection error: {e}")
+            logger.exception("YOLO detection error")
 
     def _process_yolo_box(self, box, frame, h, w, use_qreader, all_results, seen_texts):
         # Get bounding box coordinates
@@ -494,7 +494,7 @@ def detect_qr_advanced(image_path):
         print(f"[ADVANCED] --------------------------------------------------\n")
         return results, count
     except Exception as e:
-        logger.error(f"detect_qr_advanced Error: {e}")
+        logger.exception("detect_qr_advanced Error")
         print(f"[ADVANCED] EXCEPTION: {e}")
         return [], 0
 
