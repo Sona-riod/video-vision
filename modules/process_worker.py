@@ -283,25 +283,25 @@ def _write_completed_batch(ctx: Dict[str, Any]):
 
     try:
         # Insert the session record (single write)
-        db.start_session_complete(
-            session_id    = session_id,
-            source_image  = ctx["image_name"],
-            qr_list       = qr_codes,
-            beer_type     = ctx["beer_type"],
-            batch         = ctx["batch"],
-            filling_date  = ctx["filling_date"],
-            target_count  = required_count,
-            decoded_cnt   = decoded_cnt,
-            adv_used      = ctx["adv_used"],
-            adv_found     = ctx["adv_found"],
-            adimgp        = adimgp,
-            elapsed       = ctx["elapsed"],
-            api_status    = api_status,
-            batch_status  = batch_status,
-            pallet_id     = ctx["pallet_id"],
-            error_msg     = error_msg,
-            payload       = payload,
-        )
+        db.start_session_complete({
+            "session_id"   : session_id,
+            "source_image" : ctx["image_name"],
+            "qr_list"      : qr_codes,
+            "beer_type"    : ctx["beer_type"],
+            "batch"        : ctx["batch"],
+            "filling_date" : ctx["filling_date"],
+            "target_count" : required_count,
+            "decoded_cnt"  : decoded_cnt,
+            "adv_used"     : ctx["adv_used"],
+            "adv_found"    : ctx["adv_found"],
+            "adimgp"       : adimgp,
+            "elapsed"      : ctx["elapsed"],
+            "api_status"   : api_status,
+            "batch_status" : batch_status,
+            "pallet_id"    : ctx["pallet_id"],
+            "error_msg"    : error_msg,
+            "payload"      : payload,
+        })
         log.debug(f"[{session_id}] DB write complete | status={batch_status}")
     except Exception as e:
         log.exception(f"[{session_id}] DB write failed")

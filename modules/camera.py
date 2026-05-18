@@ -260,11 +260,11 @@ class CameraManager:
                 """Dummy method: no resource to release for test camera"""
                 pass
                 
-            def set(self, prop, val): 
+            def set(self, *args): 
                 """Dummy method: property setting not supported in test mode"""
                 pass
                 
-            def get(self, prop): 
+            def get(self, *args): 
                 """Dummy method: property getting not supported in test mode"""
                 return 0
                 

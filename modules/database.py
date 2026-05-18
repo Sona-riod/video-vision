@@ -311,21 +311,24 @@ class DatabaseManager:
         print(f"[DB] STARTED {session_id} | Target: {target_keg_count} | Beer: {beer_type} | Batch: {batch} | Image: {source_image}")
         return batch_no, session_id
 
-    def start_session_complete(self, session_id: str, source_image: str,
-                               qr_list: List[str], beer_type: str, batch: str,
-                               filling_date: str, target_count: int,
-                               decoded_cnt: int, adv_used: int, adv_found: int,
-                               adimgp: int, elapsed: float, api_status: str,
-                               batch_status: str, pallet_id: Optional[str],
-                               error_msg: Optional[str], payload: Optional[dict]):
+    def start_session_complete(self, session_data: dict):
         """
         Single-shot DB write at the end of processing.
         Replaces the 5-6 intermediate writes (update_batch_status, store_qr_codes,
         mark_pallet_processed, store_api_payload, finish_session, api_sender DB write).
         Uses INSERT OR REPLACE so a re-send on retry updates the existing row cleanly.
         """
-        qr_json      = json.dumps(qr_list)
+        qr_json      = json.dumps(session_data.get('qr_list', []))
+        payload      = session_data.get('payload')
         payload_json = json.dumps(payload, default=str) if payload else None
+        
+        session_id   = session_data.get('session_id')
+        batch_status = session_data.get('batch_status')
+        error_msg    = session_data.get('error_msg')
+        decoded_cnt  = session_data.get('decoded_cnt', 0)
+        target_count = session_data.get('target_count', 0)
+        elapsed      = session_data.get('elapsed', 0.0)
+        api_status   = session_data.get('api_status')
 
         with db_lock:
             conn = sqlite3.connect(self.db_path, timeout=60)
@@ -350,12 +353,12 @@ class DatabaseManager:
                      ?, ?,
                      ?)
             ''', (
-                session_id, source_image, datetime.now(), target_count,
-                beer_type, batch, filling_date,
+                session_id, session_data.get('source_image'), datetime.now(), target_count,
+                session_data.get('beer_type'), session_data.get('batch'), session_data.get('filling_date'),
                 qr_json, decoded_cnt, decoded_cnt,
-                adv_used, adv_found, adimgp,
+                session_data.get('adv_used', 0), session_data.get('adv_found', 0), session_data.get('adimgp', 0),
                 elapsed, api_status, batch_status,
-                pallet_id, error_msg, payload_json,
+                session_data.get('pallet_id'), error_msg, payload_json,
                 1 if batch_status == 'api_failed' else 0,
                 error_msg if batch_status == 'api_failed' else None,
                 datetime.now(),
@@ -508,7 +511,13 @@ class DatabaseManager:
                       advanced_found: int, decoded_count: int, total_detection: int, 
                       api_success: bool = None):
         adimgp = 1 if (decoded_count < 6 or total_detection < 6) else 0
-        status = "success" if api_success else "failed" if api_success is not None else "pending"
+        
+        if api_success is None:
+            status = "pending"
+        elif api_success:
+            status = "success"
+        else:
+            status = "failed"
         
         with db_lock:
             conn = sqlite3.connect(self.db_path, timeout=60)
