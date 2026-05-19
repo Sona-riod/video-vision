@@ -396,6 +396,7 @@ class SimpleKegHMI(MDBoxLayout):
         self._frame_times     = []
         self._last_perf_log   = time.time()
         self._no_detect_secs  = 0
+        self.processing       = False
 
         # Keep these for backward compat with display helpers
         self.required_keg_count = DEFAULT_KEG_COUNT

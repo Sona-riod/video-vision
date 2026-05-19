@@ -524,8 +524,8 @@ class APISender:
                     payload = json.loads(payload_json)
                     self.logger.info(f"Retrying {session_id} (attempt {attempts + 1})")
                     
-                    success = self._send_with_retry(session_id, payload, attempts)
-                    
+                    success, _ = self._send_with_retry(session_id, payload, attempts)
+
                     if success:
                         self._remove_from_retry_queue(session_id)
                     else:
@@ -653,8 +653,8 @@ class APISender:
                 conn.close()
             
             # Send with retry
-            success = self._send_with_retry(session_id, payload)
-            
+            success, _ = self._send_with_retry(session_id, payload)
+
             if success:
                 self.logger.info(f"Manual retry successful for {session_id}")
                 self._remove_from_retry_queue(session_id)
