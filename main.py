@@ -143,6 +143,7 @@ def _hex(r,g,b,a=1):  return (r, g, b, a)
 
 WAITING_FOR_KEGS_TEXT = 'Waiting for kegs...'
 PLACE_KEGS_TEXT = 'Place kegs under camera'
+SEND_TO_SERVER_TEXT = 'SEND TO SERVER'
 
 
 # -------------------------------------------------------------
@@ -589,6 +590,49 @@ class SimpleKegHMI(MDBoxLayout):
         self.warn_banner.add_widget(self.warn_lbl)
         self.add_widget(self.warn_banner)
 
+        # -- 2b. DUPLICATE KEG WARNING BANNER (hidden by default) --
+        self.dup_banner = MDBoxLayout(
+            orientation='horizontal',
+            size_hint_y=None, height=0,           # hidden: height=0
+            padding=[dp(16), 0],
+            spacing=dp(8),
+            opacity=0,
+        )
+        with self.dup_banner.canvas.before:
+            Color(0.8, 0.2, 0.2, 0.15)
+            self._dup_banner_bg = Rectangle(pos=self.dup_banner.pos,
+                                            size=self.dup_banner.size)
+            Color(0.8, 0.2, 0.2, 0.40)
+            self._dup_banner_line = Line(
+                points=[self.dup_banner.x, self.dup_banner.y,
+                        self.dup_banner.right, self.dup_banner.y], width=1.2)
+        self.dup_banner.bind(pos=self._redraw_dup_banner, size=self._redraw_dup_banner)
+
+        dup_icon = MDLabel(
+            text='⚠',
+            font_style='H6',
+            theme_text_color='Custom',
+            text_color=C['red'],
+            halign='center', valign='center',
+            size_hint_x=None, width=dp(30),
+        )
+        self.dup_banner.add_widget(dup_icon)
+
+        self.dup_warn_lbl = MDLabel(
+            text='SAME KEGS DETECTED — Remove and place new kegs before sending.',
+            font_style='Caption',
+            theme_text_color='Custom',
+            text_color=C['red'],
+            halign='left', valign='center',
+            bold=True,
+        )
+        self.dup_warn_lbl.bind(size=self.dup_warn_lbl.setter('text_size'))
+        self.dup_banner.add_widget(self.dup_warn_lbl)
+        self.add_widget(self.dup_banner)
+
+        # Track duplicate state for UI updates
+        self._dup_blocked = False
+
         # -- 3. MAIN SPLIT ------------------------------------
         split = MDBoxLayout(orientation='horizontal', spacing=0)
 
@@ -973,7 +1017,7 @@ class SimpleKegHMI(MDBoxLayout):
 
         # -- SEND TO SERVER ------------------------------------
         self.send_btn = DarkButton(
-            text='SEND TO SERVER',
+            text=SEND_TO_SERVER_TEXT,
             preset='dim',
             radius=8,
             font_size=dp(14),
@@ -1040,6 +1084,11 @@ class SimpleKegHMI(MDBoxLayout):
         self._banner_bg.pos   = w.pos
         self._banner_bg.size  = w.size
         self._banner_line.points = [w.x, w.y, w.right, w.y]
+
+    def _redraw_dup_banner(self, w, *_):
+        self._dup_banner_bg.pos   = w.pos
+        self._dup_banner_bg.size  = w.size
+        self._dup_banner_line.points = [w.x, w.y, w.right, w.y]
 
     def _redraw_cam_border(self, w, *_):
         self._cam_border.points = [w.right, w.y, w.right, w.top]
@@ -1396,6 +1445,19 @@ class SimpleKegHMI(MDBoxLayout):
         self.stat_detected.value_label.text  = str(qr_count)
         self.stat_stability.value_label.text = str(self.session.stability_counter)
 
+        # ── DUPLICATE KEG CHECK (live, every frame) ──────────────
+        is_blocked, is_warning, dup_msg = self.session.has_duplicate_kegs()
+        if is_blocked:
+            # Exact match → show red banner, disable send
+            self._show_dup_banner(dup_msg, blocked=True)
+        elif is_warning:
+            # Partial overlap → show orange banner, send still allowed
+            self._show_dup_banner(dup_msg, blocked=False)
+        else:
+            # No overlap → hide banner if it was showing
+            if self._dup_blocked or self.dup_banner.opacity > 0:
+                self._hide_dup_banner()
+
         state = self.session.state
         if state == ScanState.SENDING:
             self._set_status('', 'Sending to server...', 'Please wait',
@@ -1403,6 +1465,10 @@ class SimpleKegHMI(MDBoxLayout):
         elif state == ScanState.READY:
             self._set_status('', 'Ready to Send!', 'Tap Send to upload',
                              'Ready', C['green'])
+        elif is_blocked:
+            self._set_status('', 'DUPLICATE KEGS — Blocked',
+                             'Remove kegs from previous batch',
+                             'Blocked', C['red'])
         elif self.session.over_target():
             over = qr_count - self.required_keg_count
             self._set_status('', f'OVER TARGET — {qr_count} detected ({over} extra)',
@@ -1425,6 +1491,32 @@ class SimpleKegHMI(MDBoxLayout):
     def sync_qr_list_with_detection(self, qr_results):
         for qr in qr_results:
             self.add_qr_to_list(qr['data'])
+
+    # --------------------------------------------------------
+    #  DUPLICATE KEG BANNER HELPERS
+    # --------------------------------------------------------
+    def _show_dup_banner(self, message, blocked=True):
+        """Show the duplicate-keg warning banner."""
+        self.dup_warn_lbl.text = message
+        if blocked:
+            self.dup_warn_lbl.text_color = C['red']
+            self._dup_blocked = True
+            # Disable send button while duplicate kegs are present
+            if self.session.state != ScanState.SENDING:
+                self.send_btn.disabled = True
+                self.send_btn.set_preset('danger')
+                self.send_btn.text = 'BLOCKED — DUPLICATE KEGS'
+        else:
+            self.dup_warn_lbl.text_color = C['orange']
+            self._dup_blocked = False
+        self.dup_banner.height  = dp(36)
+        self.dup_banner.opacity = 1
+
+    def _hide_dup_banner(self):
+        """Hide the duplicate-keg warning banner."""
+        self.dup_banner.height  = 0
+        self.dup_banner.opacity = 0
+        self._dup_blocked = False
 
     # --------------------------------------------------------
     #  MODE SWITCHING
@@ -1510,6 +1602,13 @@ class SimpleKegHMI(MDBoxLayout):
         if self.session.state != ScanState.SCANNING:
             return
 
+        # Guard: block capture if same kegs as last sent batch
+        is_blocked, _, dup_msg = self.session.has_duplicate_kegs()
+        if is_blocked:
+            self.show_toast('Same kegs detected! Remove and place new kegs.', 'warning')
+            self.add_log(f"CAPTURE BLOCKED: {dup_msg}")
+            return
+
         batch = self.batch_field.text
         if not batch or batch == 'BATCH-':
             self.show_toast('Enter Batch Number!', 'error')
@@ -1544,7 +1643,7 @@ class SimpleKegHMI(MDBoxLayout):
         # UI feedback
         self.send_btn.disabled = False
         self.send_btn.set_preset('green')
-        self.send_btn.text = 'SEND TO SERVER'
+        self.send_btn.text = SEND_TO_SERVER_TEXT
         self._set_status('', 'Capture Complete! Ready to Send.',
                          f'{self.session.count()} QR codes recorded',
                          'Ready', C['green'])
@@ -1557,6 +1656,13 @@ class SimpleKegHMI(MDBoxLayout):
     def send_to_server(self, instance):
         # Guard: only send when in READY state
         if self.session.state != ScanState.READY:
+            return
+
+        # Guard: block send if same kegs as last sent batch
+        is_blocked, _, dup_msg = self.session.has_duplicate_kegs()
+        if is_blocked:
+            self.show_toast('Cannot send — same kegs as previous batch!', 'error')
+            self.add_log(f"SEND BLOCKED: {dup_msg}")
             return
 
         # Guard: count must match target exactly
@@ -1635,6 +1741,8 @@ class SimpleKegHMI(MDBoxLayout):
         self.update_qr_list_display()
         self.send_btn.disabled = True
         self.send_btn.set_preset('dim')
+        self.send_btn.text = SEND_TO_SERVER_TEXT
+        self._hide_dup_banner()
         self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                          'Scanning...', C['accent'])
         if self.is_auto_mode:

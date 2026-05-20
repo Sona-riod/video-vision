@@ -84,6 +84,61 @@ class SessionStore:
         """True when the current QR set is identical to the last successfully sent one."""
         return bool(self.qr_codes) and self.qr_codes == self.last_sent_qr_set
 
+    def overlap_with_last_sent(self) -> Set[str]:
+        """Return the set of QR codes that appear in both the current scan and the last sent batch."""
+        if not self.qr_codes or not self.last_sent_qr_set:
+            return set()
+        return self.qr_codes & self.last_sent_qr_set
+
+    def overlap_ratio_with_last_sent(self) -> float:
+        """
+        Fraction of *current* QR codes that were also in the last sent batch.
+        Returns 0.0 when there is nothing to compare.
+        """
+        if not self.qr_codes or not self.last_sent_qr_set:
+            return 0.0
+        overlap = self.qr_codes & self.last_sent_qr_set
+        return len(overlap) / len(self.qr_codes)
+
+    def has_duplicate_kegs(self) -> tuple:
+        """
+        Main duplicate-keg check used by the HMI.
+
+        Returns
+        -------
+        (is_blocked: bool, is_warning: bool, message: str)
+            is_blocked  – True when the current set is an *exact* match
+                          of the last sent batch → capture/send MUST be refused.
+            is_warning  – True when ≥ 50 % of current kegs overlap with the
+                          last sent batch → operator should be alerted but
+                          send is still allowed.
+            message     – Human-readable description shown in the UI.
+        """
+        if not self.last_sent_qr_set or not self.qr_codes:
+            return False, False, ""
+
+        overlap = self.overlap_with_last_sent()
+        if not overlap:
+            return False, False, ""
+
+        ratio = len(overlap) / len(self.qr_codes)
+
+        # Exact duplicate → block
+        if self.qr_codes == self.last_sent_qr_set:
+            return True, False, (
+                f"SAME KEGS DETECTED — All {len(overlap)} kegs match the "
+                f"previous batch. Remove and place new kegs."
+            )
+
+        # High overlap (≥ 50 %) → warning
+        if ratio >= 0.5:
+            return False, True, (
+                f"{len(overlap)} of {len(self.qr_codes)} kegs match the "
+                f"previous batch. Replace duplicate kegs before sending."
+            )
+
+        return False, False, ""
+
     # ─────────────────────────────────────────────────────────────
     #  State transitions
     # ─────────────────────────────────────────────────────────────
