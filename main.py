@@ -590,48 +590,46 @@ class SimpleKegHMI(MDBoxLayout):
         self.warn_banner.add_widget(self.warn_lbl)
         self.add_widget(self.warn_banner)
 
-        # -- 2b. DUPLICATE KEG WARNING BANNER (hidden by default) --
+        # -- 2b. IGNORED KEGS INFO BANNER (hidden by default) --
+        # Shows when kegs from previous pallet(s) are still visible
+        # but being ignored (continuous-flow mode)
         self.dup_banner = MDBoxLayout(
             orientation='horizontal',
-            size_hint_y=None, height=0,           # hidden: height=0
+            size_hint_y=None, height=0,
             padding=[dp(16), 0],
             spacing=dp(8),
             opacity=0,
         )
         with self.dup_banner.canvas.before:
-            Color(0.8, 0.2, 0.2, 0.15)
+            Color(0.118, 0.565, 1.0, 0.10)       # soft blue tint
             self._dup_banner_bg = Rectangle(pos=self.dup_banner.pos,
                                             size=self.dup_banner.size)
-            Color(0.8, 0.2, 0.2, 0.40)
+            Color(0.118, 0.565, 1.0, 0.30)
             self._dup_banner_line = Line(
                 points=[self.dup_banner.x, self.dup_banner.y,
                         self.dup_banner.right, self.dup_banner.y], width=1.2)
         self.dup_banner.bind(pos=self._redraw_dup_banner, size=self._redraw_dup_banner)
 
         dup_icon = MDLabel(
-            text='⚠',
+            text='ℹ',
             font_style='H6',
             theme_text_color='Custom',
-            text_color=C['red'],
+            text_color=C['accent'],
             halign='center', valign='center',
             size_hint_x=None, width=dp(30),
         )
         self.dup_banner.add_widget(dup_icon)
 
         self.dup_warn_lbl = MDLabel(
-            text='SAME KEGS DETECTED — Remove and place new kegs before sending.',
+            text='Previous kegs ignored — detecting new kegs only.',
             font_style='Caption',
             theme_text_color='Custom',
-            text_color=C['red'],
+            text_color=C['accent'],
             halign='left', valign='center',
             bold=True,
         )
         self.dup_warn_lbl.bind(size=self.dup_warn_lbl.setter('text_size'))
         self.dup_banner.add_widget(self.dup_warn_lbl)
-        self.add_widget(self.dup_banner)
-
-        # Track duplicate state for UI updates
-        self._dup_blocked = False
 
         # -- 3. MAIN SPLIT ------------------------------------
         split = MDBoxLayout(orientation='horizontal', spacing=0)
@@ -1028,6 +1026,18 @@ class SimpleKegHMI(MDBoxLayout):
         self.send_btn.bind(on_press=self.send_to_server)
         batch_section.add_widget(self.send_btn)
 
+        # -- CLEAR KEG HISTORY BUTTON -------------------------
+        self.clear_history_btn = DarkButton(
+            text='CLEAR KEG HISTORY',
+            preset='ghost',
+            radius=6,
+            font_size=dp(12),
+            bold=True,
+            size_hint_y=None, height=dp(36),
+        )
+        self.clear_history_btn.bind(on_press=self._clear_keg_history)
+        batch_section.add_widget(self.clear_history_btn)
+
         # -- FOOTER UTIL ROW ----------------------------------
         util_row = MDBoxLayout(
             orientation='horizontal',
@@ -1401,31 +1411,30 @@ class SimpleKegHMI(MDBoxLayout):
         self.warn_banner.opacity = 0
 
     def _check_auto_trigger(self, qr_list, frame):
-        # Only auto-capture when actively scanning, not mid-send
+        """Continuous auto-pallet flow.
+
+        Only NEW kegs (not in sent_qr_history) are counted.  When the
+        target count of NEW kegs is reached and stable, the system
+        auto-captures → auto-sends → auto-prints with zero operator
+        interaction.
+        """
         if not self.is_auto_mode:
             return
         if self.session.state != ScanState.SCANNING:
             return
 
-        # Extract QR strings from live detector results
-        current_qrs = set()
-        for qr in qr_list:
-            if isinstance(qr, dict) and 'data' in qr:
-                current_qrs.add(qr['data'])
-            elif isinstance(qr, str):
-                current_qrs.add(qr)
+        # session.count() already returns only NEW kegs because
+        # add_qr() filters out sent_qr_history entries.
 
-        # Do not re-capture the exact same pallet that was just sent
-        if current_qrs and current_qrs == self.session.last_sent_qr_set:
-            self.session.stability_counter = 0
-            return
-
-        # Stability check: count must be at target for STABILITY_THRESHOLD frames
+        # Stability check: NEW keg count must be at target for
+        # STABILITY_THRESHOLD consecutive frames.
         if self.session.target_reached():
             self.session.stability_counter += 1
             if self.session.stability_counter >= STABILITY_THRESHOLD:
                 self.session.stability_counter = 0
                 self.trigger_capture(frame)
+                # Fully automatic: send immediately after capture
+                Clock.schedule_once(lambda dt: self._auto_send_and_print(), 0.5)
         else:
             self.session.stability_counter = 0
 
@@ -1441,22 +1450,17 @@ class SimpleKegHMI(MDBoxLayout):
             pass
 
     def process_frame(self, frame):
-        qr_count = self.session.count()
+        qr_count = self.session.count()           # NEW kegs only
+        ignored  = self.session.ignored_count()    # kegs from previous pallets
         self.stat_detected.value_label.text  = str(qr_count)
         self.stat_stability.value_label.text = str(self.session.stability_counter)
 
-        # ── DUPLICATE KEG CHECK (live, every frame) ──────────────
-        is_blocked, is_warning, dup_msg = self.session.has_duplicate_kegs()
-        if is_blocked:
-            # Exact match → show red banner, disable send
-            self._show_dup_banner(dup_msg, blocked=True)
-        elif is_warning:
-            # Partial overlap → show orange banner, send still allowed
-            self._show_dup_banner(dup_msg, blocked=False)
-        else:
-            # No overlap → hide banner if it was showing
-            if self._dup_blocked or self.dup_banner.opacity > 0:
-                self._hide_dup_banner()
+        # ── IGNORED KEG INFO BANNER (continuous-flow) ──────────
+        has_ignored, ign_count, ign_msg = self.session.get_ignored_info()
+        if has_ignored:
+            self._show_info_banner(ign_msg)
+        elif self.dup_banner.opacity > 0:
+            self._hide_info_banner()
 
         state = self.session.state
         if state == ScanState.SENDING:
@@ -1465,22 +1469,20 @@ class SimpleKegHMI(MDBoxLayout):
         elif state == ScanState.READY:
             self._set_status('', 'Ready to Send!', 'Tap Send to upload',
                              'Ready', C['green'])
-        elif is_blocked:
-            self._set_status('', 'DUPLICATE KEGS — Blocked',
-                             'Remove kegs from previous batch',
-                             'Blocked', C['red'])
         elif self.session.over_target():
             over = qr_count - self.required_keg_count
-            self._set_status('', f'OVER TARGET — {qr_count} detected ({over} extra)',
+            self._set_status('', f'OVER TARGET — {qr_count} new ({over} extra)',
                              f'Remove {over} keg(s) to match target {self.required_keg_count}',
                              'Over', C['red'])
         elif qr_count == self.required_keg_count:
-            self._set_status('', 'Target Achieved', f'{qr_count} kegs detected',
+            self._set_status('', 'Target Achieved',
+                             f'{qr_count} new kegs detected' + (f' ({ignored} ignored)' if ignored else ''),
                              'Target Met', C['green'])
         elif qr_count > 0:
             remaining = self.required_keg_count - qr_count
-            self._set_status('', f'Detecting — {qr_count} of {self.required_keg_count}',
-                             f'{remaining} more needed', 'Detecting', C['accent'])
+            self._set_status('', f'Detecting — {qr_count} new of {self.required_keg_count}',
+                             f'{remaining} more needed' + (f' ({ignored} ignored)' if ignored else ''),
+                             'Detecting', C['accent'])
         else:
             self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                              'Scanning...', C['accent'])
@@ -1493,30 +1495,19 @@ class SimpleKegHMI(MDBoxLayout):
             self.add_qr_to_list(qr['data'])
 
     # --------------------------------------------------------
-    #  DUPLICATE KEG BANNER HELPERS
+    #  IGNORED KEGS INFO BANNER HELPERS
     # --------------------------------------------------------
-    def _show_dup_banner(self, message, blocked=True):
-        """Show the duplicate-keg warning banner."""
-        self.dup_warn_lbl.text = message
-        if blocked:
-            self.dup_warn_lbl.text_color = C['red']
-            self._dup_blocked = True
-            # Disable send button while duplicate kegs are present
-            if self.session.state != ScanState.SENDING:
-                self.send_btn.disabled = True
-                self.send_btn.set_preset('danger')
-                self.send_btn.text = 'BLOCKED — DUPLICATE KEGS'
-        else:
-            self.dup_warn_lbl.text_color = C['orange']
-            self._dup_blocked = False
-        self.dup_banner.height  = dp(36)
+    def _show_info_banner(self, message):
+        """Show the informational ignored-kegs banner (blue tint)."""
+        self.dup_warn_lbl.text       = message
+        self.dup_warn_lbl.text_color = C['accent']
+        self.dup_banner.height  = dp(32)
         self.dup_banner.opacity = 1
 
-    def _hide_dup_banner(self):
-        """Hide the duplicate-keg warning banner."""
+    def _hide_info_banner(self):
+        """Hide the ignored-kegs info banner."""
         self.dup_banner.height  = 0
         self.dup_banner.opacity = 0
-        self._dup_blocked = False
 
     # --------------------------------------------------------
     #  MODE SWITCHING
@@ -1602,13 +1593,6 @@ class SimpleKegHMI(MDBoxLayout):
         if self.session.state != ScanState.SCANNING:
             return
 
-        # Guard: block capture if same kegs as last sent batch
-        is_blocked, _, dup_msg = self.session.has_duplicate_kegs()
-        if is_blocked:
-            self.show_toast('Same kegs detected! Remove and place new kegs.', 'warning')
-            self.add_log(f"CAPTURE BLOCKED: {dup_msg}")
-            return
-
         batch = self.batch_field.text
         if not batch or batch == 'BATCH-':
             self.show_toast('Enter Batch Number!', 'error')
@@ -1656,13 +1640,6 @@ class SimpleKegHMI(MDBoxLayout):
     def send_to_server(self, instance):
         # Guard: only send when in READY state
         if self.session.state != ScanState.READY:
-            return
-
-        # Guard: block send if same kegs as last sent batch
-        is_blocked, _, dup_msg = self.session.has_duplicate_kegs()
-        if is_blocked:
-            self.show_toast('Cannot send — same kegs as previous batch!', 'error')
-            self.add_log(f"SEND BLOCKED: {dup_msg}")
             return
 
         # Guard: count must match target exactly
@@ -1722,8 +1699,9 @@ class SimpleKegHMI(MDBoxLayout):
                 self.show_toast('Batch Sent!', 'success')
                 self.add_log("SUCCESS: Batch Sent")
 
-            self.session.mark_sent()   # records last_sent_qr_set, sets state=SENT
-            Clock.schedule_once(lambda dt: self._reset_session(), 2.0)
+            self.session.mark_sent()   # records last_sent_qr_set + sent_qr_history, sets state=SENT
+            # Faster reset for continuous flow (was 2.0s)
+            Clock.schedule_once(lambda dt: self._reset_session(), 1.0)
         else:
             error = result.get('error', 'Unknown error')
             self.show_toast('Send failed — queued for retry', 'error')
@@ -1736,17 +1714,54 @@ class SimpleKegHMI(MDBoxLayout):
                              'Tap Send to try again', 'Ready', C['green'])
 
     def _reset_session(self):
-        """Reset to SCANNING state after a successful send."""
-        self.session.reset()
+        """Reset to SCANNING state after a successful send.
+
+        Continuous-flow: sent_qr_history is PRESERVED across resets
+        so kegs that remain physically under the camera are ignored.
+        The operator can clear history manually via the CLEAR KEG HISTORY button.
+        """
+        self.session.reset()   # clears qr_codes but keeps sent_qr_history
         self.update_qr_list_display()
         self.send_btn.disabled = True
         self.send_btn.set_preset('dim')
         self.send_btn.text = SEND_TO_SERVER_TEXT
-        self._hide_dup_banner()
         self._set_status('', WAITING_FOR_KEGS_TEXT, PLACE_KEGS_TEXT,
                          'Scanning...', C['accent'])
+        ignored = self.session.ignored_count()
+        if ignored > 0:
+            self.add_log(f"Ready for next pallet ({ignored} previous keg(s) will be ignored)")
         if self.is_auto_mode:
             self.add_log("Auto-resetting for next batch...")
+
+    def _auto_send_and_print(self):
+        """Fully automatic: send to server after auto-capture.
+
+        Called by _check_auto_trigger() after a successful capture.
+        The _on_send_complete() callback handles printing and reset.
+        """
+        if self.session.state != ScanState.READY:
+            return
+        self.add_log("Auto-sending to server...")
+        self.send_to_server(None)
+
+    def _clear_keg_history(self, instance=None):
+        """Operator clears the sent-keg ignore list.
+
+        Use when all kegs have been physically removed from under the camera
+        and a completely fresh pallet load is starting.
+        """
+        self.show_confirmation_dialog(
+            'Clear Keg History',
+            f'{self.session.ignored_count()} keg(s) are being ignored from previous pallets.\n'
+            'Clear the list so all kegs are detected again?',
+            lambda x: self._do_clear_history()
+        )
+
+    def _do_clear_history(self):
+        self.session.clear_history()
+        self._hide_info_banner()
+        self.add_log("Keg history cleared — all kegs will be detected")
+        self.show_toast('Keg history cleared!', 'success')
 
 
     def check_network(self, dt):

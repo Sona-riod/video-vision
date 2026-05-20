@@ -12,8 +12,14 @@ ScanState transitions:
     READY    → (user/auto presses SEND)  → SENDING
     SENDING  → (API success)             → SENT
     SENDING  → (API failure)             → READY   (allow retry)
-    SENT     → (2 s delay)              → SCANNING (reset)
-    Any      → (manual clear)           → SCANNING
+    SENT     → (brief delay)             → SCANNING (reset)
+    Any      → (manual clear)            → SCANNING
+
+Continuous-flow behaviour (client requirement):
+    After a batch is sent, kegs that remain physically under the camera
+    are IGNORED.  Only genuinely new kegs are counted toward the next
+    pallet target.  When the next target is reached the system auto-sends
+    and auto-prints again — no operator interaction needed.
 """
 
 from dataclasses import dataclass, field
@@ -49,17 +55,29 @@ class SessionStore:
     captured_at:  Optional[datetime] = None
     session_id:   Optional[str]      = None   # single source of truth — set once
 
-    # ── Last-sent guard (prevents re-capture of same pallet) ─────
-    last_sent_qr_set: Set[str] = field(default_factory=set)
+    # ── Keg history (continuous-flow guards) ──────────────────────
+    last_sent_qr_set:  Set[str] = field(default_factory=set)   # last batch only
+    sent_qr_history:   Set[str] = field(default_factory=set)   # ALL kegs ever sent (cumulative)
 
     # ─────────────────────────────────────────────────────────────
     #  QR helpers
     # ─────────────────────────────────────────────────────────────
 
     def add_qr(self, code: str) -> bool:
-        """Add a QR code string. Returns True if it is genuinely new."""
+        """
+        Add a QR code string.  Returns True if it is genuinely new.
+
+        Kegs that were already sent in a previous pallet (present in
+        ``sent_qr_history``) are silently IGNORED — they are not added
+        to the current set and do not count toward the target.
+        """
         code = code.strip() if code else ""
-        if code and code not in self.qr_codes:
+        if not code:
+            return False
+        # Ignore kegs already sent in a previous pallet
+        if code in self.sent_qr_history:
+            return False
+        if code not in self.qr_codes:
             self.qr_codes.add(code)
             return True
         return False
@@ -80,64 +98,38 @@ class SessionStore:
     def under_target(self) -> bool:
         return len(self.qr_codes) < self.target_count
 
+    # ─────────────────────────────────────────────────────────────
+    #  Sent-keg awareness helpers
+    # ─────────────────────────────────────────────────────────────
+
     def is_same_as_last_sent(self) -> bool:
         """True when the current QR set is identical to the last successfully sent one."""
         return bool(self.qr_codes) and self.qr_codes == self.last_sent_qr_set
 
-    def overlap_with_last_sent(self) -> Set[str]:
-        """Return the set of QR codes that appear in both the current scan and the last sent batch."""
-        if not self.qr_codes or not self.last_sent_qr_set:
-            return set()
-        return self.qr_codes & self.last_sent_qr_set
+    def ignored_count(self) -> int:
+        """Number of kegs currently being ignored (from previous pallets)."""
+        return len(self.sent_qr_history)
 
-    def overlap_ratio_with_last_sent(self) -> float:
-        """
-        Fraction of *current* QR codes that were also in the last sent batch.
-        Returns 0.0 when there is nothing to compare.
-        """
-        if not self.qr_codes or not self.last_sent_qr_set:
-            return 0.0
-        overlap = self.qr_codes & self.last_sent_qr_set
-        return len(overlap) / len(self.qr_codes)
+    def is_keg_ignored(self, code: str) -> bool:
+        """Check if a specific keg QR code is in the ignore list."""
+        return code.strip() in self.sent_qr_history if code else False
 
-    def has_duplicate_kegs(self) -> tuple:
+    def get_ignored_info(self) -> tuple:
         """
-        Main duplicate-keg check used by the HMI.
+        Returns status information about ignored kegs for HMI display.
 
         Returns
         -------
-        (is_blocked: bool, is_warning: bool, message: str)
-            is_blocked  – True when the current set is an *exact* match
-                          of the last sent batch → capture/send MUST be refused.
-            is_warning  – True when ≥ 50 % of current kegs overlap with the
-                          last sent batch → operator should be alerted but
-                          send is still allowed.
-            message     – Human-readable description shown in the UI.
+        (has_ignored: bool, ignored_count: int, message: str)
         """
-        if not self.last_sent_qr_set or not self.qr_codes:
-            return False, False, ""
-
-        overlap = self.overlap_with_last_sent()
-        if not overlap:
-            return False, False, ""
-
-        ratio = len(overlap) / len(self.qr_codes)
-
-        # Exact duplicate → block
-        if self.qr_codes == self.last_sent_qr_set:
-            return True, False, (
-                f"SAME KEGS DETECTED — All {len(overlap)} kegs match the "
-                f"previous batch. Remove and place new kegs."
-            )
-
-        # High overlap (≥ 50 %) → warning
-        if ratio >= 0.5:
-            return False, True, (
-                f"{len(overlap)} of {len(self.qr_codes)} kegs match the "
-                f"previous batch. Replace duplicate kegs before sending."
-            )
-
-        return False, False, ""
+        ignored = len(self.sent_qr_history)
+        if ignored == 0:
+            return False, 0, ""
+        new_count = len(self.qr_codes)
+        return True, ignored, (
+            f"{ignored} keg(s) from previous pallet(s) ignored — "
+            f"detecting new kegs only ({new_count} new so far)"
+        )
 
     # ─────────────────────────────────────────────────────────────
     #  State transitions
@@ -145,9 +137,10 @@ class SessionStore:
 
     def reset(self):
         """
-        Reset to SCANNING state.
+        Reset to SCANNING state for the next pallet.
         Clears QR accumulator and all capture data.
-        Preserves: target_count, beer_type/id, batch_number, mode, last_sent_qr_set.
+        Preserves: target_count, beer_type/id, batch_number, mode,
+                   last_sent_qr_set, **sent_qr_history** (critical for ignore).
         """
         self.qr_codes          = set()
         self.state             = ScanState.SCANNING
@@ -159,8 +152,20 @@ class SessionStore:
 
     def mark_sent(self):
         """
-        Record the QR set that was just sent so we don't re-capture it.
+        Record the QR set that was just sent.
+        Adds all kegs to the cumulative history so they are ignored
+        when the camera continues to see them after the pallet is done.
         Transitions to SENT state.
         """
         self.last_sent_qr_set = set(self.qr_codes)
+        self.sent_qr_history |= self.qr_codes       # cumulative — kegs are ignored going forward
         self.state = ScanState.SENT
+
+    def clear_history(self):
+        """
+        Operator manually clears the sent-keg ignore list.
+        Use when all kegs have been physically removed from the camera
+        area and a fresh pallet load is starting.
+        """
+        self.sent_qr_history.clear()
+        self.last_sent_qr_set.clear()
