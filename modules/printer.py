@@ -5,6 +5,8 @@ import glob
 
 logger = logging.getLogger(__name__)
 
+ZPL_ENCODING = 'utf-8'
+
 class ZebraPrinter:
     def __init__(self, device_path='/dev/usb/lp0'):
         self.device_path = device_path
@@ -41,7 +43,7 @@ class ZebraPrinter:
         try:
             # Method 1: Direct write (works if user is in 'lp' group)
             with open(self.device_path, 'wb') as printer:
-                printer.write(zpl_command.encode('utf-8'))
+                printer.write(zpl_command.encode(ZPL_ENCODING))
             logger.info("Successfully printed directly to USB.")
             return True, ""
 
@@ -51,7 +53,7 @@ class ZebraPrinter:
             try:
                 subprocess.run(
                     ['sudo', 'tee', self.device_path],
-                    input=zpl_command.encode('utf-8'),
+                    input=zpl_command.encode(ZPL_ENCODING),
                     check=True,
                     stdout=subprocess.DEVNULL,
                 )
@@ -67,8 +69,8 @@ class ZebraPrinter:
 
     def _print_via_pyusb(self, zpl_command):
         try:
-            import usb.core
-            import usb.util
+            import usb.core  # type: ignore[import-not-found]
+            import usb.util  # type: ignore[import-not-found]
         except ImportError:
             logger.error("PyUSB not installed. Cannot use USB fallback. Please run: pip install pyusb")
             return False, "PyUSB not installed"
@@ -105,7 +107,7 @@ class ZebraPrinter:
             logger.warning(f"set_configuration warning (non-fatal): {e}")
 
     def _find_out_endpoint(self, intf):
-        import usb.util
+        import usb.util  # type: ignore[import-not-found]
         return usb.util.find_descriptor(
             intf,
             custom_match=lambda e: (
@@ -114,7 +116,7 @@ class ZebraPrinter:
         )
 
     def _release_usb_resources(self, dev, interface_claimed, detached_ifaces):
-        import usb.util
+        import usb.util  # type: ignore[import-not-found]
         if interface_claimed:
             try:
                 cfg = dev.get_active_configuration()
@@ -136,7 +138,7 @@ class ZebraPrinter:
 
     def _write_to_usb_device(self, dev, zpl_command, _retry=True):
         """Write ZPL to USB device, retrying once with a full reset on [Errno 5]."""
-        import usb.util
+        import usb.util  # type: ignore[import-not-found]
 
         interface_claimed = False
         detached_ifaces = []
@@ -162,7 +164,7 @@ class ZebraPrinter:
                 return False, "Endpoint not found"
 
             # 4. Send ZPL
-            ep.write(zpl_command.encode('utf-8'), timeout=5000)
+            ep.write(zpl_command.encode(ZPL_ENCODING), timeout=5000)
             logger.info("Successfully printed using PyUSB.")
             return True, ""
 

@@ -13,6 +13,11 @@ import os
 import sys
 import platform
 
+# Torch device identifiers
+DEVICE_CPU = 'cpu'
+DEVICE_CUDA = 'cuda'
+DEVICE_MPS = 'mps'
+
 # Initialize logger
 _gpu_logger = None
 
@@ -35,7 +40,7 @@ GPU_STATUS = {
     'mps_available': False,  # Mac Metal Performance Shaders
     'gpu_name': 'N/A',
     'gpu_memory': 'N/A',
-    'torch_device': 'cpu',
+    'torch_device': DEVICE_CPU,
     'opencv_cuda': False,
     'platform': platform.system(),
 }
@@ -88,7 +93,7 @@ class GPUInfo:
             # Check PyTorch CUDA
             self._detect_pytorch_cuda(logger)
             # Check CuPy
-            self._detect_cupy(logger)
+            self._detect_cupy()
         
         # Summary
         self._print_summary(logger)
@@ -121,7 +126,7 @@ class GPUInfo:
         """Enable MPS and update status."""
         self.mps_available = True
         GPU_STATUS['mps_available'] = True
-        GPU_STATUS['torch_device'] = 'mps'
+        GPU_STATUS['torch_device'] = DEVICE_MPS
         GPU_STATUS['gpu_name'] = 'Apple Metal GPU'
         
         # Get Mac GPU info via subprocess
@@ -188,7 +193,7 @@ class GPUInfo:
                 GPU_STATUS['cuda_available'] = True
                 GPU_STATUS['gpu_name'] = torch.cuda.get_device_name(0)
                 GPU_STATUS['gpu_memory'] = f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
-                GPU_STATUS['torch_device'] = 'cuda'
+                GPU_STATUS['torch_device'] = DEVICE_CUDA
                 
                 self.cuda_device_name = GPU_STATUS['gpu_name']
                 self.cuda_available = True
@@ -202,14 +207,15 @@ class GPUInfo:
         except Exception as e:
             print(f"[!] PyTorch Error: {e}")
 
-    def _detect_cupy(self, logger):
+    def _detect_cupy(self):
         """Detect CuPy availability (CUDA only)."""
+        import importlib.util
         try:
-            import cupy as cp
-            self.cupy_available = True
-            print("CuPy: AVAILABLE")
-        except ImportError:
-            print("CuPy: NOT INSTALLED")
+            if importlib.util.find_spec('cupy') is not None:
+                self.cupy_available = True
+                print("CuPy: AVAILABLE")
+            else:
+                print("CuPy: NOT INSTALLED")
         except Exception as e:
             print(f"CuPy: ERROR - {e}")
 
@@ -266,10 +272,10 @@ def get_torch_device() -> str:
     if GPU_INFO is None:
         GPU_INFO = GPUInfo()
     if GPU_INFO.mps_available:
-        return 'mps'
+        return DEVICE_MPS
     elif GPU_INFO.cuda_available:
-        return 'cuda'
-    return 'cpu'
+        return DEVICE_CUDA
+    return DEVICE_CPU
 
 
 class GPUImageProcessor:
@@ -298,94 +304,89 @@ class GPUImageProcessor:
         else:
             self.logger.info("GPUImageProcessor initialized with CPU fallback")
     
+    @staticmethod
+    def _is_gpu_mat(frame):
+        return hasattr(cv2, 'cuda_GpuMat') and isinstance(frame, cv2.cuda_GpuMat)
+
+    def _to_gpu_mat(self, frame):
+        """Upload to GpuMat if needed; pass through if already on GPU."""
+        if self._is_gpu_mat(frame):
+            return frame
+        gpu_frame = cv2.cuda_GpuMat()
+        gpu_frame.upload(frame)
+        return gpu_frame
+
+    def _to_cpu_array(self, frame):
+        """Download from GpuMat if needed; pass through otherwise."""
+        if self._is_gpu_mat(frame):
+            return frame.download()
+        return frame
+
+    def _run_gpu_op(self, op_name, gpu_fn, cpu_fn, frame):
+        """Run gpu_fn on a GpuMat; on failure, fall back to cpu_fn on a CPU array."""
+        try:
+            return gpu_fn(self._to_gpu_mat(frame))
+        except Exception as e:
+            self.logger.warning(f"GPU {op_name} failed, using CPU: {e}")
+            return cpu_fn(self._to_cpu_array(frame))
+
     def upload_to_gpu(self, frame):
         """Upload frame to GPU memory (CUDA only)."""
         if not self.gpu_available:
             return frame
-        
         try:
-            gpu_frame = cv2.cuda_GpuMat()
-            gpu_frame.upload(frame)
-            return gpu_frame
+            return self._to_gpu_mat(frame)
         except Exception as e:
             self.logger.warning(f"GPU upload failed: {e}")
             return frame
-    
+
     def download_from_gpu(self, gpu_frame):
         """Download frame from GPU memory."""
         if not self.gpu_available:
             return gpu_frame
-        
         try:
-            if hasattr(cv2, 'cuda_GpuMat') and isinstance(gpu_frame, cv2.cuda_GpuMat):
-                return gpu_frame.download()
-            return gpu_frame
+            return self._to_cpu_array(gpu_frame)
         except Exception as e:
             self.logger.warning(f"GPU download failed: {e}")
             return gpu_frame
-    
+
     def cvt_color_gpu(self, frame, code):
         """GPU-accelerated color conversion (CUDA) or CPU fallback."""
         if not self.gpu_available:
             return cv2.cvtColor(frame, code)
-        
-        try:
-            if not isinstance(frame, cv2.cuda_GpuMat):
-                gpu_frame = cv2.cuda_GpuMat()
-                gpu_frame.upload(frame)
-            else:
-                gpu_frame = frame
-            
-            result = cv2.cuda.cvtColor(gpu_frame, code)
-            return result
-        except Exception as e:
-            self.logger.warning(f"GPU cvtColor failed, using CPU: {e}")
-            if hasattr(cv2, 'cuda_GpuMat') and isinstance(frame, cv2.cuda_GpuMat):
-                frame = frame.download()
-            return cv2.cvtColor(frame, code)
-    
+        return self._run_gpu_op(
+            'cvtColor',
+            lambda g: cv2.cuda.cvtColor(g, code),
+            lambda c: cv2.cvtColor(c, code),
+            frame,
+        )
+
     def resize_gpu(self, frame, size):
         """GPU-accelerated resize (CUDA) or CPU fallback."""
         if not self.gpu_available:
             return cv2.resize(frame, size)
-        
-        try:
-            if not isinstance(frame, cv2.cuda_GpuMat):
-                gpu_frame = cv2.cuda_GpuMat()
-                gpu_frame.upload(frame)
-            else:
-                gpu_frame = frame
-            
-            result = cv2.cuda.resize(gpu_frame, size)
-            return result
-        except Exception as e:
-            self.logger.warning(f"GPU resize failed, using CPU: {e}")
-            if hasattr(cv2, 'cuda_GpuMat') and isinstance(frame, cv2.cuda_GpuMat):
-                frame = frame.download()
-            return cv2.resize(frame, size)
-    
+        return self._run_gpu_op(
+            'resize',
+            lambda g: cv2.cuda.resize(g, size),
+            lambda c: cv2.resize(c, size),
+            frame,
+        )
+
     def gaussian_blur_gpu(self, frame, ksize=(5, 5)):
         """GPU-accelerated Gaussian blur (CUDA) or CPU fallback."""
         if not self.gpu_available:
             return cv2.GaussianBlur(frame, ksize, 0)
-        
-        try:
-            if not isinstance(frame, cv2.cuda_GpuMat):
-                gpu_frame = cv2.cuda_GpuMat()
-                gpu_frame.upload(frame)
-            else:
-                gpu_frame = frame
-            
-            gaussian_filter = cv2.cuda.createGaussianFilter(
-                gpu_frame.type(), -1, ksize, 0
-            )
-            result = gaussian_filter.apply(gpu_frame)
-            return result
-        except Exception as e:
-            self.logger.warning(f"GPU GaussianBlur failed, using CPU: {e}")
-            if hasattr(cv2, 'cuda_GpuMat') and isinstance(frame, cv2.cuda_GpuMat):
-                frame = frame.download()
-            return cv2.GaussianBlur(frame, ksize, 0)
+
+        def _gpu_blur(g):
+            f = cv2.cuda.createGaussianFilter(g.type(), -1, ksize, 0)
+            return f.apply(g)
+
+        return self._run_gpu_op(
+            'GaussianBlur',
+            _gpu_blur,
+            lambda c: cv2.GaussianBlur(c, ksize, 0),
+            frame,
+        )
 
 
 # Create global image processor
