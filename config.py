@@ -27,8 +27,9 @@ CAMERA_CONFIG = {
 
 
 # ========== API CONFIGURATION ==========
-API_ENDPOINT = "https://api-dev.checkology-cloud.io/api/kegs/fillingareaupdatecamera"
-BEER_TYPES_ENDPOINT = "https://api-dev.checkology-cloud.io/api/kegs/cam/beer-types"
+BASE_URL = "https://api-dev.checkology-cloud.io"
+API_ENDPOINT = f"{BASE_URL}/api/kegs/fillingareaupdatecamera"
+BEER_TYPES_ENDPOINT = f"{BASE_URL}/api/kegs/cam/beer-types"
 CAMERA_NAME = "ICAM-540"
 CAMERA_MAC_ID = "3C:6D:66:01:5A:F0"
 CAMERA_SERIAL = "icam-540"
@@ -38,7 +39,7 @@ SSL_VERIFY = False  # Set to True in production
 ENABLE_PAYLOAD_HASH = True
 
 # Cloud sync settings
-CLOUD_CONFIG_ENDPOINT = f"{API_ENDPOINT}/api/current-config"
+CLOUD_CONFIG_ENDPOINT = f"{BASE_URL}/api/current-config"
 CLOUD_SYNC_INTERVAL = 30
 
 
