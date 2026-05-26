@@ -27,8 +27,8 @@ CAMERA_CONFIG = {
 
 
 # ========== API CONFIGURATION ==========
-API_ENDPOINT = "https://api2.checkology-cloud.io/api/kegs/fillingareaupdatecamera"
-BEER_TYPES_ENDPOINT = "https://api2.checkology-cloud.io/api/kegs/cam/beer-types"
+API_ENDPOINT = "https://api-dev.checkology-cloud.io/api/kegs/fillingareaupdatecamera"
+BEER_TYPES_ENDPOINT = "https://api-dev.checkology-cloud.io/api/kegs/cam/beer-types"
 CAMERA_NAME = "ICAM-540"
 CAMERA_MAC_ID = "3C:6D:66:01:5A:F0"
 CAMERA_SERIAL = "icam-540"
