@@ -1911,8 +1911,8 @@ class SimpleKegApp(MDApp):
     def init_hmi(self):
         """
         Called by SplashScreen.start_init() on the first rendered frame.
-        Builds SimpleKegHMI (which runs deferred_init in background).
-        The HMI holds a reference to the splash for status updates.
+        Builds SimpleKegHMI (which runs deferred_nit in background).
+        The HMI holds a reference to the splash for stiatus updates.
         """
         self._hmi = SimpleKegHMI(splash=self.splash)
 
@@ -1925,6 +1925,9 @@ class SimpleKegApp(MDApp):
         self.root_window.add_widget(hmi)
 
     def on_stop(self):
+        if getattr(self, '_stopped', False):
+            return
+        self._stopped = True
         try:
             shutdown()
         except Exception as e:
