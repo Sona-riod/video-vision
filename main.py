@@ -105,7 +105,8 @@ def get_qr_detector_class():
 from config import (
     CAMERA_CONFIG, DEFAULT_KEG_COUNT, MAX_KEG_COUNT, SAVE_FOLDER,
     MIN_KEG_COUNT, STABILITY_THRESHOLD,
-    CLOUD_CONFIG_ENDPOINT, CLOUD_SYNC_INTERVAL, CAMERA_MAC_ID, GPU_CONFIG
+    CLOUD_CONFIG_ENDPOINT, CLOUD_SYNC_INTERVAL, CAMERA_MAC_ID, GPU_CONFIG,
+    CAMERA_INIT_ENABLED
 )
 
 # -- GPU Detection ---------------------------------------------
@@ -352,6 +353,7 @@ class QRListItem(MDBoxLayout):
 
 # SplashScreen — root-widget splash (modules/splash.py + modules/theme.py)
 from modules.splash import SplashScreen
+from modules.camera_init_splash import CameraInitSplash
 
 
 # -------------------------------------------------------------
@@ -1901,12 +1903,40 @@ class SimpleKegApp(MDApp):
         self.theme_cls.accent_palette  = "Teal"
         Window.clearcolor = C['bg']
 
-        # ── Show splash as the REAL root widget ───────────────
-        # No ModalView race — the splash IS the window content.
+        self._active_root = None
+
+        # ── Camera-init phase first (if enabled) ──────────────
+        # Configures the Advantech camera over its REST API and creates
+        # /dev/video10 before the HMI opens it. On success it hands off to
+        # the original SplashScreen via on_camera_init_done().
+        if CAMERA_INIT_ENABLED:
+            cam_splash = CameraInitSplash(app=self)
+            self._active_root = cam_splash
+            Clock.schedule_once(cam_splash.start, 0.5)
+            return cam_splash
+
+        # ── Otherwise: original splash as the REAL root widget ─
         self.splash = SplashScreen(app=self)
-        # Kick off HMI init on the first rendered frame
+        self._active_root = self.splash
         Clock.schedule_once(self.splash.start_init, 0.5)
         return self.splash
+
+    def _set_root_widget(self, widget):
+        """Swap the full-screen root widget at the window level."""
+        if self._active_root is not None:
+            self.root_window.remove_widget(self._active_root)
+        self.root_window.add_widget(widget)
+        self._active_root = widget
+
+    def on_camera_init_done(self):
+        """
+        Called by CameraInitSplash once the camera REST sequence succeeds.
+        Swaps in the original SplashScreen, which then runs the normal
+        init_hmi -> deferred_init -> show_hmi flow.
+        """
+        self.splash = SplashScreen(app=self)
+        self._set_root_widget(self.splash)
+        Clock.schedule_once(self.splash.start_init, 0.3)
 
     def init_hmi(self):
         """
@@ -1921,8 +1951,7 @@ class SimpleKegApp(MDApp):
         Swap the splash out and replace the root widget with the HMI.
         Called by SimpleKegHMI.deferred_init() when init is complete.
         """
-        self.root_window.remove_widget(self.root)
-        self.root_window.add_widget(hmi)
+        self._set_root_widget(hmi)
 
     def on_stop(self):
         if getattr(self, '_stopped', False):

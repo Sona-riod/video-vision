@@ -26,6 +26,19 @@ CAMERA_CONFIG = {
 }
 
 
+# ========== CAMERA HARDWARE INIT (Advantech REST API) ==========
+CAMERA_INIT_ENABLED   = True                  # False = skip the camera-init splash (dev)
+CAMERA_API_BASE_URL   = "http://localhost:5000"
+CAMERA_INIT_WIDTH     = 3840                   # 4K, matches camera_configure.sh
+CAMERA_INIT_HEIGHT    = 2160
+CAMERA_INIT_TIMEOUT   = 10                     # per-request timeout (s)
+# Per-step "settle" waits (s) — mirror the sleeps in camera_configure.sh
+CAMERA_INIT_SETTLE_AFTER_CLOSE = 5
+CAMERA_INIT_SETTLE_AFTER_OPEN  = 5
+CAMERA_INIT_SETTLE_AFTER_PLAY  = 5
+CAMERA_INIT_SETTLE_AFTER_RESET = 2
+
+
 # ========== API CONFIGURATION ==========
 BASE_URL = "https://api-dev.checkology-cloud.io"
 API_ENDPOINT = f"{BASE_URL}/api/kegs/fillingareaupdatecamera"
