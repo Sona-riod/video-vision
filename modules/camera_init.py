@@ -31,7 +31,9 @@ from config import (
     CAMERA_API_BASE_URL,
     CAMERA_INIT_WIDTH,
     CAMERA_INIT_HEIGHT,
+    CAMERA_INIT_CONNECT_TIMEOUT,
     CAMERA_INIT_TIMEOUT,
+    CAMERA_INIT_AUTOFOCUS_TIMEOUT,
     CAMERA_INIT_SETTLE_AFTER_CLOSE,
     CAMERA_INIT_SETTLE_AFTER_OPEN,
     CAMERA_INIT_SETTLE_AFTER_PLAY,
@@ -81,7 +83,10 @@ def _build_steps():
 
         {"label": "Starting auto-focus",
          "endpoint": "/camera/autofocus_start", "data": None,
-         "settle": 0},
+         "settle": 0,
+         # autofocus_start holds the response open until the lens physically
+         # locks focus — needs a much longer read timeout than the other steps.
+         "timeout": CAMERA_INIT_AUTOFOCUS_TIMEOUT},
     ]
 
 
@@ -111,18 +116,27 @@ class CameraInitializer:
         self._thread.start()
 
     # ----------------------------------------------------------
-    def _post(self, endpoint, data):
+    def _post(self, endpoint, data, read_timeout):
         """POST one step. Returns (ok: bool, message: str)."""
         url = f"{self.base_url}{endpoint}"
-        logger.debug("POST %s | data=%s", url, data)
+        logger.debug("POST %s | data=%s | read_timeout=%ss", url, data, read_timeout)
         try:
             # camera_configure.sh uses `curl -F` (multipart). `data=` (urlencoded)
             # is accepted by the Advantech API; switch to files={k:(None,v)} if a
             # future firmware insists on multipart.
-            resp = requests.post(url, data=data, timeout=CAMERA_INIT_TIMEOUT)
+            # (connect, read) timeout: fail fast if daemon is down, be patient otherwise.
+            resp = requests.post(
+                url, data=data,
+                timeout=(CAMERA_INIT_CONNECT_TIMEOUT, read_timeout))
+        except (requests.ConnectionError, requests.ConnectTimeout) as e:
+            logger.error("Cannot reach camera service at %s: %s", url, e)
+            return False, "cannot reach camera service (is the camera daemon running?)"
+        except requests.ReadTimeout as e:
+            logger.error("No response from %s within %ss: %s", url, read_timeout, e)
+            return False, f"no response within {read_timeout}s — camera may be busy"
         except requests.RequestException as e:
             logger.error("Request failed for %s: %s", url, e)
-            return False, f"cannot reach camera service ({e.__class__.__name__})"
+            return False, f"request failed ({e.__class__.__name__})"
 
         body = (resp.text or "").strip()
         logger.debug("Response | status=%s | body=%s", resp.status_code, body or "<empty>")
@@ -143,7 +157,8 @@ class CameraInitializer:
             self.status_cb(label + "…")
             logger.info("Step %d/%d - %s", idx, total, label)
 
-            ok, msg = self._post(step["endpoint"], step["data"])
+            read_timeout = step.get("timeout", CAMERA_INIT_TIMEOUT)
+            ok, msg = self._post(step["endpoint"], step["data"], read_timeout)
             if not ok:
                 error = f"{label} failed ({msg})"
                 logger.error("Camera init aborted: %s", error)

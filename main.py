@@ -78,7 +78,7 @@ from modules.api_sender import APISender
 import modules.process_worker as process_worker
 from modules.process_worker import submit_batch, shutdown
 from modules.session_store import SessionStore, ScanState
-from modules.utils import setup_logging, create_timestamp, save_last_batch, load_last_batch
+from modules.utils import setup_logging, create_timestamp, save_last_batch, load_last_batch, get_process_logger
 # --- ADDED PRINTER MODULE ---
 from modules.printer import ZebraPrinter  
 
@@ -368,6 +368,9 @@ class SimpleKegHMI(MDBoxLayout):
 
         # Keep reference to splash (owned by App) for status updates
         self.splash = splash
+
+        # Process log — full text trail of the run (logs/process_<date>.log)
+        self.process_logger = get_process_logger()
 
         main_logger.info("Initializing SimpleKegHMI (Dark HMI UI)...")
 
@@ -1886,6 +1889,11 @@ class SimpleKegHMI(MDBoxLayout):
 
     def add_log(self, message):
         print(message)
+        # Persist the full process flow to a timestamped text file.
+        try:
+            self.process_logger.info(message)
+        except Exception:
+            pass
 
     def update_filling_date(self, dt):
         pass

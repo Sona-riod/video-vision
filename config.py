@@ -31,7 +31,11 @@ CAMERA_INIT_ENABLED   = True                  # False = skip the camera-init spl
 CAMERA_API_BASE_URL   = "http://localhost:5000"
 CAMERA_INIT_WIDTH     = 3840                   # 4K, matches camera_configure.sh
 CAMERA_INIT_HEIGHT    = 2160
-CAMERA_INIT_TIMEOUT   = 10                     # per-request timeout (s)
+# Split connect/read timeouts: a down daemon fails fast (connection refused is
+# instant), while slow-but-working endpoints get the patience curl had (no --max-time).
+CAMERA_INIT_CONNECT_TIMEOUT   = 5              # fail fast if daemon is down (s)
+CAMERA_INIT_TIMEOUT           = 15             # default per-request READ timeout (s)
+CAMERA_INIT_AUTOFOCUS_TIMEOUT = 60             # autofocus_start blocks until lens locks (s)
 # Per-step "settle" waits (s) — mirror the sleeps in camera_configure.sh
 CAMERA_INIT_SETTLE_AFTER_CLOSE = 5
 CAMERA_INIT_SETTLE_AFTER_OPEN  = 5

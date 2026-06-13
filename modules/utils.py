@@ -24,6 +24,50 @@ def setup_logging(log_level=logging.INFO, log_file=None):
     
     return logging.getLogger(__name__)
 
+_process_logger = None
+
+def get_process_logger():
+    """Return a singleton logger that writes the full HMI process flow to a
+    daily rotating text file under config.LOGS_DIR (logs/process_YYYY-MM-DD.log).
+
+    Every message passed to SimpleKegHMI.add_log() is recorded here with a
+    timestamp so the operator/support has a complete text trail of the run:
+    mode switches, captures, sends, successes/failures, prints, cloud sync,
+    camera and beer-type events, etc.
+    """
+    global _process_logger
+    if _process_logger is not None:
+        return _process_logger
+
+    try:
+        # Imported lazily to avoid a circular import at module load time.
+        from config import LOGS_DIR
+        logs_dir = Path(LOGS_DIR)
+    except Exception:
+        logs_dir = Path(__file__).parent.parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = logs_dir / f"process_{datetime.now().strftime('%Y-%m-%d')}.log"
+
+    logger = logging.getLogger("PalletProcess")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # don't double-print via the root logger
+
+    # Guard against attaching duplicate handlers if called more than once.
+    already = any(
+        isinstance(h, logging.FileHandler)
+        and getattr(h, "baseFilename", None) == str(log_file)
+        for h in logger.handlers
+    )
+    if not already:
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        logger.addHandler(fh)
+
+    _process_logger = logger
+    return logger
+
 def manage_storage(folder_path, max_size_mb):
     """Manage storage space by cleaning old files"""
     try:
