@@ -70,6 +70,12 @@ except ImportError:
     from pathlib import Path
     QR_MODEL_PATH = Path(__file__).parent.parent / "models" / "model_qr" / "best.pt"
 
+# YOLO inference size — large enough to localize small/distant QR codes in a 4K frame.
+try:
+    from config import YOLO_IMGSZ
+except ImportError:
+    YOLO_IMGSZ = 1280
+
 print("="*60)
 print("DETECTOR STATUS:")
 print(f"   Pyzbar: {'OK' if PYZBAR_AVAILABLE else 'FAILED'}")
@@ -104,7 +110,16 @@ class QRDetector:
             except Exception as e:
                 logger.exception("Failed to load YOLO model")
                 self.model = None
-        
+
+        # Inference device for YOLO: GPU if CUDA is available, else CPU.
+        self.device = 0
+        try:
+            import torch
+            self.device = 0 if torch.cuda.is_available() else 'cpu'
+        except Exception:
+            self.device = 'cpu'
+        logger.info(f"YOLO inference device={self.device}, imgsz={YOLO_IMGSZ}")
+
         # OpenCV QR detector as last resort fallback
         self.cv_detector = cv2.QRCodeDetector()
         
@@ -326,8 +341,9 @@ class QRDetector:
 
     def _run_yolo_detection(self, frame, use_qreader, all_results, seen_texts):
         try:
-            # Run YOLO inference
-            yolo_results = self.model(frame, verbose=False, conf=self.confidence_threshold)
+            # Run YOLO inference. imgsz is large so small QRs survive in 4K; device pins GPU.
+            yolo_results = self.model(frame, verbose=False, conf=self.confidence_threshold,
+                                      imgsz=YOLO_IMGSZ, device=self.device)
             
             h, w = frame.shape[:2]
             

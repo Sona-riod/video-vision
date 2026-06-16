@@ -20,8 +20,8 @@ LOGS_DIR.mkdir(exist_ok=True)
 CAMERA_CONFIG = {
     'type': 'v4l2',    # Jetson typically uses v4l2
     'device': 10,       # Default to 0 (Video0) - Adjust if using specific ID like 10
-    'width': 1408,     # ICAM-540 max resolution
-    'height': 1080,
+    'width': 3840,     # 4K — MUST match the REST camera-init (camera_configure.sh) so the
+    'height': 2160,    # decoder actually receives full 4K frames for QR decoding.
     'fps': 30,
 }
 
@@ -72,6 +72,17 @@ MIN_OCCLUSION_THRESHOLD = 0.7
 # Model Configuration
 QR_MODEL_PATH = MODELS_DIR / "model_qr" / "best.pt"
 QR_CONF_THRESHOLD = 0.5
+
+# ── Live pipeline: 4K decode, downscaled display ──────────────────────────────
+# The camera streams 4K (for QR decode accuracy). The live preview is rendered at a
+# smaller size so the UI thread never uploads a full 4K frame — this is what keeps the
+# feed smooth/lag-free while decoding stays at full 4K in the background.
+PREVIEW_WIDTH  = 1280          # live-preview width (downscaled from 4K just for display)
+PREVIEW_HEIGHT = 720           # live-preview height
+DETECT_MIN_INTERVAL = 0.10     # min seconds between background detections (~10 Hz); each
+                               # detection still runs on the FULL 4K frame
+YOLO_IMGSZ = 1280              # YOLO inference size — large enough to localize small/distant
+                               # QR codes in a 4K frame (default 640 loses them)
 
 # Pallet Status options
 PALLET_STATUS = ["CREATED"]

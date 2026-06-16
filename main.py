@@ -106,7 +106,7 @@ from config import (
     CAMERA_CONFIG, DEFAULT_KEG_COUNT, MAX_KEG_COUNT, SAVE_FOLDER,
     MIN_KEG_COUNT, STABILITY_THRESHOLD,
     CLOUD_CONFIG_ENDPOINT, CLOUD_SYNC_INTERVAL, CAMERA_MAC_ID, GPU_CONFIG,
-    CAMERA_INIT_ENABLED
+    CAMERA_INIT_ENABLED, PREVIEW_WIDTH, PREVIEW_HEIGHT, DETECT_MIN_INTERVAL
 )
 
 # -- GPU Detection ---------------------------------------------
@@ -402,6 +402,8 @@ class SimpleKegHMI(MDBoxLayout):
         self._frame_times     = []
         self._last_perf_log   = time.time()
         self._no_detect_secs  = 0
+        self._no_detect_start = None     # wall-clock start of a no-QR stretch (auto→manual timeout)
+        self._last_detect_ts  = 0.0      # last time a background detection was submitted (throttle)
         self.processing       = False
 
         # Keep these for backward compat with display helpers
@@ -1334,41 +1336,64 @@ class SimpleKegHMI(MDBoxLayout):
     #  FRAME UPDATE  (unchanged logic)
     # --------------------------------------------------------
     def update_frame(self, dt):
+        """LANE 3 — DISPLAY ONLY. Runs at the UI tick; never blocks on QR decode.
+
+        Pulls the latest 4K frame, kicks/collects background detection on the FULL 4K
+        frame, then shows a downscaled (PREVIEW) copy with the most-recent boxes. The
+        decode runs in the background (Lane 2), so the preview stays smooth even though
+        each decode is at full 4K.
+        """
         if not self.detection_active or not self.camera:
             return
-        ret, frame = self.camera.get_frame()
+        ret, frame = self.camera.get_frame_no_copy()   # read-only ref to the latest 4K frame
         if not ret or frame is None:
             return
-        vis_frame = frame.copy()
-        # Don't run new detection while sending (SENDING/SENT) — just show live feed
-        if self.session.state in (ScanState.SENDING, ScanState.SENT):
-            self._draw_qr_overlays(vis_frame)
-            self._update_preview_texture(vis_frame)
-            return
-        self._handle_detection_process(frame)
-        self._draw_qr_overlays(vis_frame)
-        self._update_preview_texture(vis_frame)
-        self.process_frame(frame)
 
-    def _draw_qr_overlays(self, vis_frame):
+        # Don't run new detection while sending (SENDING/SENT) — just show the live feed.
+        sending = self.session.state in (ScanState.SENDING, ScanState.SENT)
+        if not sending:
+            self._service_detection(frame)
+
+        # 4K -> PREVIEW for display; draw the latest boxes (scaled); upload one texture.
+        disp = cv2.resize(frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT), interpolation=cv2.INTER_AREA)
+        self._draw_qr_overlays_scaled(disp, frame.shape[1], frame.shape[0])
+        self._update_preview_texture(disp)
+
+        if not sending:
+            self.process_frame(frame)
+
+    def _draw_qr_overlays_scaled(self, disp, src_w, src_h):
+        """Draw the latest detection boxes (in full-res/4K coords) onto the downscaled
+        preview, scaling the coordinates to the preview size."""
         try:
+            sx = disp.shape[1] / float(src_w)
+            sy = disp.shape[0] / float(src_h)
             for qr in self.latest_qr_results:
                 x1, y1, x2, y2 = qr['bbox']
-                cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (63, 185, 80), 3)
+                x1, y1 = int(x1 * sx), int(y1 * sy)
+                x2, y2 = int(x2 * sx), int(y2 * sy)
+                cv2.rectangle(disp, (x1, y1), (x2, y2), (63, 185, 80), 2)
                 if 'data' in qr:
-                    label = qr['data'][:10]
-                    cv2.putText(vis_frame, label, (x1, y1-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (63, 185, 80), 2)
+                    cv2.putText(disp, qr['data'][:10], (x1, max(0, y1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (63, 185, 80), 1)
         except Exception:
             pass
 
-    def _handle_detection_process(self, frame):
+    def _service_detection(self, frame):
+        """LANE 2 trigger — collect a finished detection and, if due, submit a new one on
+        the FULL 4K frame. Single-in-flight + time-throttled, so decode rate is decoupled
+        from the display tick and the UI never waits on a 4K decode."""
         try:
-            if self.current_detection_task and self.current_detection_task.done():
+            if self.current_detection_task is not None and self.current_detection_task.done():
                 self._process_detection_results(frame)
-            if self.current_detection_task is None:
+
+            now = time.time()
+            if (self.current_detection_task is None
+                    and now - self._last_detect_ts >= DETECT_MIN_INTERVAL):
+                self._last_detect_ts = now
+                # One 4K copy, only when we actually submit (~10x/s, not every UI tick).
                 self.current_detection_task = self.detector_executor.submit(
-                    self.qr_detector.detect_and_decode, frame, False
+                    self.qr_detector.detect_and_decode, frame.copy(), False
                 )
         except Exception:
             pass
@@ -1383,14 +1408,15 @@ class SimpleKegHMI(MDBoxLayout):
                     self.sync_qr_list_with_detection(qr_list)
                     self._check_auto_trigger(qr_list, frame)
                     # Reset no-detect watchdog on success
-                    self._no_detect_secs = 0
+                    self._no_detect_start = None
                 else:
-                    # Count seconds of no detection (called ~30fps so scale)
-                    self._no_detect_secs += 1
-                    if (self.is_auto_mode
-                            and not self.processing
-                            and self._no_detect_secs > 7 * 30):   # 7 s x 30 fps
-                        self._trigger_no_detect_switch()
+                    # No QR this cycle. Detection is now throttled (not 30 fps), so use a
+                    # wall-clock timeout instead of a frame counter.
+                    if self.is_auto_mode and not self.processing:
+                        if self._no_detect_start is None:
+                            self._no_detect_start = time.time()
+                        elif time.time() - self._no_detect_start > 7.0:   # 7 s with no QR
+                            self._trigger_no_detect_switch()
         except Exception as e:
             main_logger.warning(f"Detection error: {e}")
         finally:
@@ -1399,6 +1425,7 @@ class SimpleKegHMI(MDBoxLayout):
     def _trigger_no_detect_switch(self):
         """Auto-switch to manual when QR codes absent for too long."""
         self._no_detect_secs = 0
+        self._no_detect_start = None
         self.add_log("No QR detected  switching to Manual mode")
         Clock.schedule_once(lambda dt: self._apply_no_detect_ui(), 0)
 
@@ -1444,12 +1471,19 @@ class SimpleKegHMI(MDBoxLayout):
             self.session.stability_counter = 0
 
     def _update_preview_texture(self, frame):
+        """Reuse a single texture and flip via texture coords (no per-frame Texture.create
+        or cv2.flip). `frame` is already downscaled to PREVIEW size, so the GPU upload is
+        ~2.6 MB instead of a full 4K ~24 MB — this is the core lag fix."""
         try:
             h, w = frame.shape[:2]
-            texture = Texture.create(size=(w, h), colorfmt='bgr')
-            flipped = cv2.flip(frame, 0)
-            texture.blit_buffer(flipped.tobytes(), colorfmt='bgr', bufferfmt='ubyte')
-            self.preview_image.texture = texture
+            tex = self._preview_texture
+            if tex is None or self._texture_size != (w, h):
+                tex = Texture.create(size=(w, h), colorfmt='bgr')
+                tex.flip_vertical()                      # replaces per-frame cv2.flip
+                self._preview_texture = tex
+                self._texture_size = (w, h)
+            tex.blit_buffer(frame.tobytes(), colorfmt='bgr', bufferfmt='ubyte')
+            self.preview_image.texture = tex
             self.preview_image.canvas.ask_update()
         except Exception:
             pass

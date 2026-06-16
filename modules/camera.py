@@ -51,6 +51,7 @@ class CameraManager:
         self._frame_count = 0
         self._last_fps_time = time.time()
         self._current_fps = 0.0
+        self._shape_logged = False   # log the ACTUAL decoded frame size once
         
         logger.info(f"CameraManager initialized with config: {self.config.get('type', 'unknown')}")
 
@@ -164,6 +165,13 @@ class CameraManager:
                 start = time.perf_counter()
                 ret, frame = self.cap.read()
                 capture_time = (time.perf_counter() - start) * 1000
+
+                # One-time sanity check: are we actually decoding the resolution we asked
+                # for? (REST init sets 4K; confirm OpenCV isn't clamping to something else.)
+                if not self._shape_logged and frame is not None:
+                    self._shape_logged = True
+                    logger.info(f"[CAMERA] ACTUAL decoded frame shape: {frame.shape} "
+                                f"(requested {self.config.get('width')}x{self.config.get('height')})")
                 
                 # Auto-loop for video files
                 if not ret and self.config.get('type') == 'file':

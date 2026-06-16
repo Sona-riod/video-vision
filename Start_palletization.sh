@@ -55,6 +55,18 @@ echo ""
 echo "[INFO] Launching main.py..."
 echo "$SEPARATOR"
 
+# 3b. Expose the user-site YOLO stack to root's Python.
+#     torch/torchvision/ultralytics live in /home/icam-540/.local (torchvision is an .egg
+#     that only activates via full site processing — PYTHONPATH is NOT enough). The app
+#     runs as root via the sudo desktop launcher, so without this YOLO silently falls back
+#     to slow full-frame Pyzbar. PYTHONUSERBASE triggers user-site processing without
+#     changing HOME (Kivy still writes to /root).
+export PYTHONUSERBASE=/home/icam-540/.local
+
+# Preflight: show in the terminal whether YOLO/CUDA will actually be available this launch.
+$PY_CMD -c "import torch, ultralytics; print('[PREFLIGHT] torch', torch.__version__, '| CUDA', torch.cuda.is_available(), '| ultralytics', ultralytics.__version__)" \
+    || echo "[PREFLIGHT][WARN] YOLO stack NOT importable — detection will run WITHOUT YOLO" >&2
+
 # 4. Run the application (script is already running with sudo from desktop launcher)
 $PY_CMD main.py
 
