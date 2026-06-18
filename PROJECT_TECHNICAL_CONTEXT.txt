@@ -1,0 +1,173 @@
+# Current Project Technical Context
+
+### Purpose
+This repository is a Python-based industrial HMI for automated keg counting, QR-code reading, pallet tracking, and cloud batch processing. It is designed for an NVIDIA Jetson Orin + Advantech ICAM-540 camera environment, with a dark Kivy/KivyMD touchscreen UI.
+
+---
+
+## Core Entry Points
+
+- main.py
+  - Primary application entry point and HMI implementation.
+  - Builds the UI, initializes hardware and cloud services, and manages the live detection loop.
+  - Uses `SessionStore` to manage scan state and continuous-flow pallet logic.
+
+- run.py
+  - Thin launcher that ensures the current directory is on `sys.path` and starts `SimpleKegApp`.
+
+- Start_palletization.sh
+  - Linux/Jetson launcher script for environment startup and permissions.
+
+---
+
+## Configuration
+
+- config.py
+  - Central configuration for camera, preview, detection, API, GPU, retry/backoff, and app behavior.
+  - Defines 4K capture settings (`3840x2160`) and downscaled preview (`1280x720`).
+  - Includes API endpoint configuration and Jetson/Advantech camera init parameters.
+
+---
+
+## Main Application Architecture
+
+### 3-Lane Pipeline
+The system deliberately separates work into three lanes to avoid UI freezes:
+
+1. **Capture lane**
+   - camera.py
+   - Dedicated background capture thread reads frames from the camera continuously.
+
+2. **Decode lane**
+   - detector.py
+   - Background worker performs YOLO localization + QR decode on full 4K frames.
+   - Uses `pyzbar` primarily, with `qreader` and OpenCV fallback support.
+   - Advanced detection fallback exists in advanced.py.
+
+3. **Display lane**
+   - main.py / Kivy UI refreshes at ~30 Hz.
+   - Renders downscaled preview and overlays latest detection boxes without blocking on decode.
+
+---
+
+## Hardware & Detection
+
+- camera_init.py
+  - Configures the Advantech ICAM-540 camera via its local REST API before capture.
+  - Steps include close/open, timestamp disable, 4K resolution, play, autofocus, and reset focus.
+
+- camera_init_splash.py
+  - Startup splash screen shown while camera initialization runs.
+
+- gpu_utils.py
+  - Detects CUDA/OpenCV GPU availability and supports CPU/MPS fallback.
+  - Jetson-specific GPU checks and warmup logic are referenced from main.py.
+
+- detector.py
+  - Main `QRDetector` class.
+  - Pipeline:
+    - YOLO localizes QR code regions in 4K.
+    - Crops and decodes with Pyzbar.
+    - Falls back to enhanced preprocessing: upscale, CLAHE, sharpen.
+    - Optionally uses `QReader` lazy-loaded on demand.
+
+- advanced.py
+  - More aggressive detection mode with tiled scanning, YOLO cropping, and enhanced decode.
+  - Used when the live count is short of the target.
+
+---
+
+## Session & Batch Management
+
+- session_store.py
+  - In-memory state machine for scan sessions.
+  - Manages states: `SCANNING`, `READY`, `SENDING`, `SENT`.
+  - Tracks current QR set, last sent set, and cumulative ignored QR history for continuous flow.
+
+- process_worker.py
+  - Background batch submission worker.
+  - Accepts captured frame paths, session ID, QR codes, and metadata.
+  - Runs cloud send in a thread pool, avoids race conditions, and writes DB results.
+
+- api_sender.py
+  - Sends batch payloads to cloud API.
+  - Implements retry/backoff, payload hashing, and response handling.
+  - Fetches beer type list from cloud.
+
+---
+
+## Persistence & Recovery
+
+- database.py
+  - SQLite manager with WAL mode and schema migration support.
+  - Tables include:
+    - `detection_sessions`
+    - `decoded_data`
+    - `processed_pallets`
+    - `retry_queue`
+    - `system_alerts`
+    - `system_events`
+    - `pallet_lifecycle`
+
+- recovery.py
+  - Startup recovery and integrity checks.
+  - Detects stuck/failed batches, re-adds pending payloads to retry queue, and resolves stale alerts.
+
+- utils.py
+  - General helpers: logging setup, file cleanup, timestamp creation, batch persistence.
+  - Includes helper functions to save/load last batch and update config values.
+
+---
+
+## Printing
+
+- printer.py
+  - Zebra label printer support.
+  - Direct USB write to `/dev/usb/lp*` or fallback via `sudo tee`.
+  - PyUSB fallback support for unsupported direct access.
+
+---
+
+## UI and Theming
+
+- main.py
+  - Implements the Kivy/KivyMD HMI, including:
+    - top bar
+    - warning banners
+    - mode status
+    - quota and QR list display
+    - manual/auto capture controls
+    - app-level lifecycle and background scheduling
+
+- splash.py
+  - Initial splash screen before the HMI loads.
+
+- theme.py
+  - Shared dark theme color palette used by the UI.
+
+---
+
+## Technology Stack
+
+- Python 3.x
+- Kivy / KivyMD for touchscreen UI
+- OpenCV (`cv2`) for camera capture and image processing
+- `pyzbar` for QR decoding
+- `ultralytics.YOLO` for QR localization model
+- SQLite for local persistence
+- `requests` for REST API calls
+- Threading / `ThreadPoolExecutor` for non-blocking capture, detection, and batch send
+
+---
+
+## Current Focus
+
+This project is currently structured as an industrial edge application with:
+- full 4K QR decoding,
+- responsive touchscreen HMI,
+- Jetson GPU-aware behavior,
+- cloud sync and retry handling,
+- failure recovery,
+- printer integration,
+- and continuous-flow pallet handling.
+
